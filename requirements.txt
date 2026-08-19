@@ -1,0 +1,8 @@
+mujoco==3.11.0
+mujoco-mjx==3.11.0
+brax==0.14.2
+flax==0.12.9
+optax==0.2.8
+PyYAML==6.0.3
+wandb==0.28.1
+evosax==0.3.1
