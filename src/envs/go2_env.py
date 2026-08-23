@@ -98,7 +98,22 @@ class Go2Env(PipelineEnv):
         # 4. Initialize our custom variables
         initial_action = jnp.zeros(12)
         # Commands are now 4D: [v_x, v_y, omega_z, is_sitting]
-        initial_commands = jnp.array([0.0, 0.0, 0.0, 0.0])
+        
+        # 1. 20% chance to Sit (1.0), 80% chance to Move (0.0)
+        is_sitting = jax.random.bernoulli(rng_sit, p=0.2).astype(jnp.float32)
+
+        # 2. Sample random angle and bounded magnitude for realistic 2D movement
+        angle = jax.random.uniform(rng_vel, minval=-jnp.pi, maxval=jnp.pi)
+        speed = jax.random.uniform(rng_vel, minval=0.0, maxval=1.0)
+        v_x = jnp.cos(angle) * speed
+        v_y = jnp.sin(angle) * speed
+        
+        # 3. Cap angular velocity
+        omega_z = jax.random.uniform(rng_vel, minval=-0.5, maxval=0.5)
+
+        initial_commands = jnp.array([v_x, v_y, omega_z, is_sitting])
+        
+        
         # Pick a random target sit pose from our dataset of 100
         target_sit_pose = jax.random.choice(rng_sit, self.sit_dataset)
         
@@ -114,7 +129,8 @@ class Go2Env(PipelineEnv):
             "last_action": initial_action,
             "commands": initial_commands,
             "target_sit_pose": target_sit_pose, # Add this to memory!
-            "step_count": jnp.array(0)
+            "step_count": jnp.array(0),
+            "is_crashed": jnp.array(0.0)
         }
         
         return State(
@@ -164,7 +180,10 @@ class Go2Env(PipelineEnv):
         # The exact same logic used in the reward function determines the episode end
         is_flipped = g_proj[2] > 0.0
         is_bottomed_out = z_height < 0.13
-        done = jnp.where(jnp.logical_or(is_flipped, is_bottomed_out), 1.0, 0.0)
+        # Define the boolean explicitly here
+        is_crashed_bool = jnp.logical_or(is_flipped, is_bottomed_out)
+        
+        done = jnp.where(is_crashed_bool, 1.0, 0.0)
         
         # --- 6. Generate Next Observation ---
         obs = self._get_obs(pipeline_state, action, commands)
@@ -173,7 +192,7 @@ class Go2Env(PipelineEnv):
         info = state.info
         info["last_action"] = action
         info["step_count"] += 1
-        
+        info["is_crashed"] = jnp.where(is_crashed_bool, 1.0, 0.0).astype(jnp.float32)
         return state.replace(
             pipeline_state=pipeline_state,
             obs=obs,
