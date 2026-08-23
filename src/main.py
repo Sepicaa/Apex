@@ -32,7 +32,6 @@ def main():
     
     # 1. Setup Configuration 
     cfg = PPOConfig(
-        num_envs=64,
         num_steps=128,
         num_epochs=3,
         num_minibatches=8,
