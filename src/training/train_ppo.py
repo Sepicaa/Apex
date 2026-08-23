@@ -19,7 +19,7 @@ class PPOConfig(NamedTuple):
     clip_eps: float = 0.2
     entropy_coef: float = 0.05
     num_steps: int = 128
-    num_epochs: int = 3
+    num_epochs: int = 5
     num_minibatches: int = 8
     max_grad_norm: float = 0.5
 
