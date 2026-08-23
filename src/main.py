@@ -32,12 +32,13 @@ def main():
     
     # 1. Setup Configuration 
     cfg = PPOConfig(
-        num_envs=64,       # <-- 64 parallel actors!
-        num_steps=256,     # 256 steps per environment = 16,384 total transitions per iter
-        num_epochs=5, 
+        num_envs=64,
+        num_steps=256,
+        num_epochs=5,
         num_minibatches=32,
         lr_actor=3e-4,
-        lr_critic=1e-3
+        lr_critic=1e-3,
+        entropy_coef=0.02
     )
     rng = jax.random.PRNGKey(42)
     rng, rng_env, rng_init = jax.random.split(rng, 3)
