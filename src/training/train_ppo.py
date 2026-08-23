@@ -10,17 +10,17 @@ from src.training.gae import compute_gae
 from src.envs.go2_env import Go2Env
 
 class PPOConfig(NamedTuple):
-    num_envs: int = 64
+    num_envs: int = 128
     lr_actor: float = 3e-4
     lr_critic: float = 1e-3
     weight_decay: float = 1e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    entropy_coef: float = 0.01
-    num_steps: int = 256
-    num_epochs: int = 10
-    num_minibatches: int = 32
+    entropy_coef: float = 0.05
+    num_steps: int = 128
+    num_epochs: int = 3
+    num_minibatches: int = 8
     max_grad_norm: float = 0.5
 
 

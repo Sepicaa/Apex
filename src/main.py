@@ -32,10 +32,11 @@ def main():
     
     # 1. Setup Configuration 
     cfg = PPOConfig(
-        num_envs=64,       # <-- 64 parallel actors!
-        num_steps=256,     # 256 steps per environment = 16,384 total transitions per iter
-        num_epochs=5, 
-        num_minibatches=32,
+        num_envs=64,
+        num_steps=128,
+        num_epochs=3,
+        num_minibatches=8,
+        entropy_coef=0.05,
         lr_actor=3e-4,
         lr_critic=1e-3
     )
@@ -46,10 +47,10 @@ def main():
     xml_path = "third_party/mujoco_menagerie/unitree_go2/scene.xml"
     env = Go2Env(xml_path=xml_path)
     
-    # Wrap the environment!
-    env = EpisodeWrapper(env, episode_length=1000, action_repeat=1) # Max steps
-    env = AutoResetWrapper(env) # Instantly reset on crash/done
-    env = VmapWrapper(env)      # Vectorize across num_envs
+    # --- UPGRADE: action_repeat=2 for 2x physical speed ---
+    env = EpisodeWrapper(env, episode_length=1000, action_repeat=2) 
+    env = AutoResetWrapper(env)
+    env = VmapWrapper(env)      
     
     actor = Actor(action_dim=12)
     critic = Critic()
@@ -59,19 +60,31 @@ def main():
     obs_dim = env.observation_size 
     actor_state, critic_state = create_train_states(actor, critic, obs_dim, cfg, rng_init)
     
-    # We must split the env key into `num_envs` keys for the batched reset
     jit_reset = jax.jit(env.reset)
     env_state = jit_reset(jax.random.split(rng_env, cfg.num_envs))
 
-    # Optional: Setup Checkpointing
+    # --- UPGRADE: Checkpoint Resume Infrastructure ---
     ckpt_dir = os.path.abspath("./checkpoints")
     checkpointer = ocp.StandardCheckpointer()
+    start_iteration = 0
+    
+    if os.path.exists(ckpt_dir) and os.listdir(ckpt_dir):
+        existing_ckpts = [int(d.split('_')[1]) for d in os.listdir(ckpt_dir) if d.startswith('step_')]
+        if existing_ckpts:
+            latest_step = max(existing_ckpts)
+            print(f"[*] Found existing checkpoint! Resuming from Iteration {latest_step}...")
+            
+            restored_params = checkpointer.restore(os.path.join(ckpt_dir, f"step_{latest_step}"))
+            actor_state = actor_state.replace(params=restored_params)
+            start_iteration = latest_step + 1
 
     total_iterations = 1000
     print("Starting Training Loop!")
     print("-" * 80)
+    
     global_start_time = time.time()
-    for i in range(total_iterations):
+    
+    for i in range(start_iteration, total_iterations):
         start_time = time.time()
         
         rng, iter_rng = jax.random.split(rng)
