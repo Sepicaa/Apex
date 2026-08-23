@@ -32,14 +32,13 @@ def main():
     
     # 1. Setup Configuration 
     cfg = PPOConfig(
-        num_envs=64,
+        num_envs=32,
         num_steps=128,
         num_epochs=3,
         num_minibatches=8,
         entropy_coef=0.05,
         lr_actor=3e-4,
         lr_critic=1e-3,
-        entropy_coef=0.02
     )
     rng = jax.random.PRNGKey(42)
     rng, rng_env, rng_init = jax.random.split(rng, 3)
