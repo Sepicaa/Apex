@@ -34,7 +34,7 @@ def main():
     cfg = PPOConfig(
         num_envs=32,
         num_steps=128,
-        num_epochs=3,
+        num_epochs=5,
         num_minibatches=8,
         entropy_coef=0.05,
         lr_actor=3e-4,

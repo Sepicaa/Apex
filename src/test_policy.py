@@ -119,7 +119,7 @@ def load_trained_actor(ckpt_dir: str, obs_dim: int = 49, action_dim: int = 12):
 # --- Main Simulation Loop ---
 def main():
     xml_path = "third_party/mujoco_menagerie/unitree_go2/scene.xml"
-    ckpt_path = os.path.abspath("./checkpoints/step_50")  # Change to your target checkpoint
+    ckpt_path = os.path.abspath("./checkpoints/step_500")  # Change to your target checkpoint
 
     # Nominal joint configuration (Matching Go2Env)
     q_nom = np.array([
