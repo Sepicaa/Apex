@@ -4,14 +4,12 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-import jax
-import jax.numpy as jnp
+import torch
 import mujoco
 import mujoco.viewer
 import numpy as np
-import orbax.checkpoint as ocp
 
-from src.training.networks import Actor
+from src.networks.actor_critic import Actor
 
 # --- Shared Command State ---
 class InteractiveCommandState:
@@ -19,22 +17,20 @@ class InteractiveCommandState:
         self.v_x = 0.0
         self.v_y = 0.0
         self.omega_z = 0.0
-        self.is_sitting = 0.0
         self.should_reset = False
         self.running = True
 
-    def get_command_array(self) -> jnp.ndarray:
-        return jnp.array([self.v_x, self.v_y, self.omega_z, self.is_sitting], dtype=jnp.float32)
+    def get_command_array(self) -> np.ndarray:
+        return np.array([self.v_x, self.v_y, self.omega_z], dtype=np.float32)
 
 
 # --- Tkinter Control Dashboard ---
 def start_control_panel(cmd_state: InteractiveCommandState):
     root = tk.Tk()
     root.title("Unitree Go2 Teleop Controller")
-    root.geometry("380x360")
+    root.geometry("380x300")
     root.resizable(False, False)
 
-    # Styling
     style = ttk.Style(root)
     style.theme_use("clam")
 
@@ -58,16 +54,10 @@ def start_control_panel(cmd_state: InteractiveCommandState):
     wz_slider.set(0.0)
     wz_slider.pack(pady=2)
 
-    # Sitting Checkbox
-    sit_var = tk.BooleanVar(value=False)
-    sit_chk = ttk.Checkbutton(root, text="Execute Sitting Posture (is_sitting)", variable=sit_var)
-    sit_chk.pack(pady=10)
-
     def update_values():
         cmd_state.v_x = float(vx_slider.get())
         cmd_state.v_y = float(vy_slider.get())
         cmd_state.omega_z = float(wz_slider.get())
-        cmd_state.is_sitting = 1.0 if sit_var.get() else 0.0
         if cmd_state.running:
             root.after(20, update_values)
 
@@ -75,13 +65,12 @@ def start_control_panel(cmd_state: InteractiveCommandState):
         vx_slider.set(0.0)
         vy_slider.set(0.0)
         wz_slider.set(0.0)
-        sit_var.set(False)
 
     def trigger_reset():
         cmd_state.should_reset = True
 
     btn_frame = ttk.Frame(root)
-    btn_frame.pack(pady=10)
+    btn_frame.pack(pady=15)
     ttk.Button(btn_frame, text="Stop / Zero", command=zero_all).grid(row=0, column=0, padx=5)
     ttk.Button(btn_frame, text="Reset Robot", command=trigger_reset).grid(row=0, column=1, padx=5)
 
@@ -97,7 +86,7 @@ def start_control_panel(cmd_state: InteractiveCommandState):
 # --- Math & Quaternion Helpers ---
 def quat_rotate_inverse(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     """Rotates vector v from world frame to body frame using inverse quaternion [w, x, y, z]."""
-    w, x, y, z = q[0], -q[1], -q[2], -q[3]  # Conjugate / Inverse
+    w, x, y, z = q[0], -q[1], -q[2], -q[3]
     q_vec = np.array([x, y, z])
     uv = np.cross(q_vec, v)
     uuv = np.cross(q_vec, uv)
@@ -105,21 +94,25 @@ def quat_rotate_inverse(q: np.ndarray, v: np.ndarray) -> np.ndarray:
 
 
 # --- Policy Checkpoint Loader ---
-def load_trained_actor(ckpt_dir: str, obs_dim: int = 49, action_dim: int = 12):
-    actor = Actor(action_dim=action_dim)
-    dummy_obs = jnp.zeros((1, obs_dim))
-    key = jax.random.PRNGKey(0)
-    empty_params = actor.init(key, dummy_obs)
-
-    checkpointer = ocp.StandardCheckpointer()
-    restored_params = checkpointer.restore(ckpt_dir, target=empty_params)
-    return actor, restored_params
+def load_trained_actor(ckpt_path: str, obs_dim: int = 48, action_dim: int = 12):
+    actor = Actor(obs_dim=obs_dim, action_dim=action_dim)
+    
+    # Load on CPU to avoid unnecessary GPU VRAM usage during viewer test
+    device = torch.device('cpu')
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    
+    # Extract just the actor weights from the saved dictionary
+    actor.load_state_dict(checkpoint['actor_state_dict'])
+    actor.eval()  # Set network to evaluation mode (disables dropout/batchnorm if any existed)
+    
+    return actor
 
 
 # --- Main Simulation Loop ---
 def main():
     xml_path = "third_party/mujoco_menagerie/unitree_go2/scene.xml"
-    ckpt_path = os.path.abspath("./checkpoints/step_50")  # Change to your target checkpoint
+    # Make sure to point this to a generated .pt file!
+    ckpt_path = os.path.abspath("./checkpoints/step_150.pt")  
 
     # Nominal joint configuration (Matching Go2Env)
     q_nom = np.array([
@@ -135,7 +128,8 @@ def main():
 
     # 2. Load Neural Policy
     print(f"Loading checkpoint from: {ckpt_path}")
-    actor, params = load_trained_actor(ckpt_path, obs_dim=49, action_dim=12)
+    # Note: obs_dim is now 48 (since we removed the 1D sitting command)
+    actor = load_trained_actor(ckpt_path, obs_dim=48, action_dim=12)
 
     # 3. Launch UI Thread
     cmd_state = InteractiveCommandState()
@@ -161,13 +155,13 @@ def main():
                 last_action = np.zeros(12, dtype=np.float32)
                 cmd_state.should_reset = False
 
-            # --- 1. Construct 49D Observation ---
-            v_base = d.qvel[:3]
-            omega_base = d.qvel[3:6]
-            quat = d.qpos[3:7]  # [w, x, y, z]
+            # --- 1. Construct 48D Observation ---
+            v_base = d.qvel[:3].copy()
+            omega_base = d.qvel[3:6].copy()
+            quat = d.qpos[3:7].copy()
             g_proj = quat_rotate_inverse(quat, np.array([0.0, 0.0, -1.0]))
-            q_joints = d.qpos[7:19]
-            dq_joints = d.qvel[6:18]
+            q_joints = d.qpos[7:19].copy()
+            dq_joints = d.qvel[6:18].copy()
             commands = cmd_state.get_command_array()
 
             obs = np.concatenate([
@@ -181,13 +175,17 @@ def main():
             ]).astype(np.float32)
 
             # --- 2. Policy Inference (Deterministic Mean) ---
-            obs_jax = jnp.array(obs)[None, :]
-            mean_action, _ = actor.apply(params, obs_jax)
-            action = np.array(mean_action[0])
+            obs_tensor = torch.as_tensor(obs).unsqueeze(0)  # Add batch dimension
+            with torch.no_grad():
+                # The PyTorch Actor forward pass returns (mean, log_std)
+                mean_action, _ = actor(obs_tensor)
+            
+            action = mean_action.squeeze(0).numpy()
             action_clipped = np.clip(action, -1.0, 1.0)
 
             # --- 3. Action Scaling & PD Actuation ---
-            action_scaled = action_clipped * 0.8
+            # Adjusted back to 0.5 to match the new environment spec!
+            action_scaled = action_clipped * 0.5
             target_angles = q_nom + action_scaled
             d.ctrl[:] = target_angles
             last_action = action_clipped
@@ -203,7 +201,6 @@ def main():
             sleep_time = (m.opt.timestep * n_frames) - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
-
 
 if __name__ == "__main__":
     main()

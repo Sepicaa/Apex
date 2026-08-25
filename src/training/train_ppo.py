@@ -1,218 +1,163 @@
-import jax
-import jax.numpy as jnp
-import optax
-from flax.training.train_state import TrainState
-from typing import NamedTuple, Tuple
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import BatchSampler, SubsetRandomSampler
+from typing import NamedTuple, Tuple, Dict
+import numpy as np
 
 from src.training.networks import Actor, Critic
-from src.training.rollout import collect_rollouts, Transition
+from src.training.rollout import collect_rollouts, RolloutBuffer
 from src.training.gae import compute_gae
-from src.envs.go2_env import Go2Env
 
 class PPOConfig(NamedTuple):
-    num_envs: int = 128
+    num_envs: int = 16          # Lowered for CPU 
     lr_actor: float = 3e-4
     lr_critic: float = 1e-3
     weight_decay: float = 1e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    entropy_coef: float = 0.05
+    entropy_coef: float = 0.01  # Standard exploration
     num_steps: int = 128
-    num_epochs: int = 3
+    num_epochs: int = 5
     num_minibatches: int = 8
     max_grad_norm: float = 0.5
 
 
-# --- 1. Loss Functions ---
-
-def actor_loss_fn(actor_params, actor: Actor, batch: Transition, advantages: jax.Array, clip_eps: float, entropy_coef: float):
-    mean, log_std = actor.apply(actor_params, batch.obs)
-    std = jnp.exp(log_std)
-
-    # Current policy log probability
-    log_prob = -0.5 * jnp.sum(
-        ((batch.action - mean) / std) ** 2 + 2 * log_std + jnp.log(2 * jnp.pi),
-        axis=-1
-    )
-
-    # Probability ratio: r(theta) = exp(log_pi - log_pi_old)
-    ratio = jnp.exp(log_prob - batch.log_prob)
-
-    # Clipped surrogate objective
-    surr1 = ratio * advantages
-    surr2 = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
-    policy_loss = -jnp.mean(jnp.minimum(surr1, surr2))
-
-    # Entropy bonus: H = 0.5 + 0.5 * log(2 * pi) + sum(log_std)
-    entropy = jnp.mean(jnp.sum(log_std + 0.5 * (1.0 + jnp.log(2 * jnp.pi)), axis=-1))
-    
-    total_actor_loss = policy_loss - entropy_coef * entropy
-    return total_actor_loss, (policy_loss, entropy)
-
-
-def critic_loss_fn(critic_params, critic: Critic, batch_obs: jax.Array, targets: jax.Array):
-    values = critic.apply(critic_params, batch_obs)
-    value_loss = 0.5 * jnp.mean(jnp.square(values - targets))
-    return value_loss, value_loss
-
-
-# --- 2. Update Epoch on Minibatches ---
-
-def update_minibatch(actor_state: TrainState, critic_state: TrainState,
-                     actor: Actor, critic: Critic,
-                     minibatch: Transition, mb_advantages: jax.Array, mb_targets: jax.Array,
-                     cfg: PPOConfig):
-    
-    # Actor gradient update
-    grad_actor_fn = jax.value_and_grad(actor_loss_fn, has_aux=True)
-    (_, (p_loss, ent)), actor_grads = grad_actor_fn(
-        actor_state.params, actor, minibatch, mb_advantages, cfg.clip_eps, cfg.entropy_coef
-    )
-    new_actor_state = actor_state.apply_gradients(grads=actor_grads)
-
-    # Critic gradient update
-    grad_critic_fn = jax.value_and_grad(critic_loss_fn, has_aux=True)
-    (_, v_loss), critic_grads = grad_critic_fn(
-        critic_state.params, critic, minibatch.obs, mb_targets
-    )
-    new_critic_state = critic_state.apply_gradients(grads=critic_grads)
-
-    metrics = {
-        "policy_loss": p_loss,
-        "value_loss": v_loss,
-        "entropy": ent
-    }
-    return new_actor_state, new_critic_state, metrics
-
-# --- 3. Multi-Epoch Minibatch Update ---
-
-def update_epoch(
-    actor_state: TrainState, critic_state: TrainState,
-    actor: Actor, critic: Critic,
-    trajectories: Transition, advantages: jax.Array, targets: jax.Array,
-    cfg: PPOConfig, rng: jax.Array
-):
-    # --- 1. Flatten the (num_steps, num_envs) dimensions ---
-    batch_size = cfg.num_steps * cfg.num_envs
-    minibatch_size = batch_size // cfg.num_minibatches
-
-    # Reshape all trajectory data from (256, 64, ...) to (16384, ...)
-    flat_trajectories = jax.tree_util.tree_map(
-        lambda x: x.reshape((batch_size,) + x.shape[2:]), trajectories
-    )
-    flat_adv = advantages.reshape((batch_size,))
-    flat_targets = targets.reshape((batch_size,))
-
-    # --- 2. Advantage Normalization ---
-    norm_advantages = (flat_adv - jnp.mean(flat_adv)) / (jnp.std(flat_adv) + 1e-8)
-
-    def _epoch_step(carry, _):
-        act_state, crit_state, key = carry
-        key, perm_key = jax.random.split(key)
-
-        # --- 3. Permute / Shuffle the FLATTENED buffer ---
-        permutation = jax.random.permutation(perm_key, batch_size)
-        
-        shuffled_batch = jax.tree_util.tree_map(lambda x: x[permutation], flat_trajectories)
-        shuffled_adv = norm_advantages[permutation]
-        shuffled_targets = flat_targets[permutation]
-
-        # --- 4. Reshape into minibatches ---
-        mb_batches = jax.tree_util.tree_map(
-            lambda x: jnp.reshape(x, (cfg.num_minibatches, minibatch_size) + x.shape[1:]),
-            shuffled_batch
-        )
-        mb_adv = jnp.reshape(shuffled_adv, (cfg.num_minibatches, minibatch_size))
-        mb_targ = jnp.reshape(shuffled_targets, (cfg.num_minibatches, minibatch_size))
-
-        # --- 5. Scan over minibatches ---
-        def _minibatch_step(inner_carry, mb_data):
-            a_st, c_st = inner_carry
-            mb_trans, mb_a, mb_t = mb_data
-            new_a_st, new_c_st, metrics = update_minibatch(
-                a_st, c_st, actor, critic, mb_trans, mb_a, mb_t, cfg
-            )
-            return (new_a_st, new_c_st), metrics
-
-        (act_state, crit_state), epoch_metrics = jax.lax.scan(
-            _minibatch_step,
-            (act_state, crit_state),
-            (mb_batches, mb_adv, mb_targ)
-        )
-
-        return (act_state, crit_state, key), epoch_metrics
-
-    # Scan across all training epochs
-    initial_carry = (actor_state, critic_state, rng)
-    (final_actor_state, final_critic_state, _), all_metrics = jax.lax.scan(
-        _epoch_step, initial_carry, None, length=cfg.num_epochs
-    )
-
-    return final_actor_state, final_critic_state, all_metrics
-
-
-# --- 4. TrainState Initializer Helper ---
+# --- 1. TrainState Initializer Helper ---
 
 def create_train_states(
+    obs_dim: int, action_dim: int, cfg: PPOConfig, device: torch.device
+) -> Tuple[Actor, Critic, optim.Optimizer, optim.Optimizer]:
+    
+    # Initialize Networks
+    actor = Actor(obs_dim=obs_dim, action_dim=action_dim).to(device)
+    critic = Critic(obs_dim=obs_dim).to(device)
+
+    # Initialize Optimizers (replaces Optax TrainState)
+    actor_optim = optim.AdamW(actor.parameters(), lr=cfg.lr_actor, weight_decay=cfg.weight_decay)
+    critic_optim = optim.AdamW(critic.parameters(), lr=cfg.lr_critic, weight_decay=cfg.weight_decay)
+
+    return actor, critic, actor_optim, critic_optim
+
+
+# --- 2. Multi-Epoch Minibatch Update ---
+
+def update_ppo(
     actor: Actor, critic: Critic,
-    obs_dim: int, cfg: PPOConfig, rng: jax.Array
-) -> Tuple[TrainState, TrainState]:
-    rng_act, rng_crit = jax.random.split(rng)
-    dummy_obs = jnp.zeros((1, obs_dim))
+    actor_optim: optim.Optimizer, critic_optim: optim.Optimizer,
+    buffer: RolloutBuffer, advantages: torch.Tensor, targets: torch.Tensor,
+    cfg: PPOConfig
+) -> Dict[str, float]:
+    
+    # --- 1. Flatten the Rollout Buffer (num_steps, num_envs) -> (num_steps * num_envs) ---
+    b_obs = buffer.obs.view(-1, buffer.obs.shape[-1])
+    b_actions = buffer.actions.view(-1, buffer.actions.shape[-1])
+    b_log_probs = buffer.log_probs.view(-1)
+    
+    b_advantages = advantages.view(-1)
+    b_targets = targets.view(-1)
+    
+    batch_size = b_obs.shape[0]
+    minibatch_size = batch_size // cfg.num_minibatches
+    
+    # --- 2. Advantage Normalization ---
+    b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+    
+    total_p_loss, total_v_loss, total_ent = 0.0, 0.0, 0.0
+    
+    # --- 3. Multi-Epoch Minibatch Optimization ---
+    for epoch in range(cfg.num_epochs):
+        # Create random permutations for minibatches
+        sampler = BatchSampler(SubsetRandomSampler(range(batch_size)), minibatch_size, drop_last=True)
+        
+        for indices in sampler:
+            mb_obs = b_obs[indices]
+            mb_actions = b_actions[indices]
+            mb_log_probs = b_log_probs[indices]
+            mb_advantages = b_advantages[indices]
+            mb_targets = b_targets[indices]
+            
+            # --- ACTOR UPDATE ---
+            _, new_log_probs, entropy = actor.get_action(mb_obs, mb_actions)
+            
+            # Probability ratio: r(theta) = exp(log_pi - log_pi_old)
+            ratio = torch.exp(new_log_probs - mb_log_probs)
+            
+            # Clipped surrogate objective
+            surr1 = ratio * mb_advantages
+            surr2 = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * mb_advantages
+            policy_loss = -torch.min(surr1, surr2).mean()
+            
+            entropy_loss = entropy.mean()
+            total_actor_loss = policy_loss - cfg.entropy_coef * entropy_loss
+            
+            # Backpropagation
+            actor_optim.zero_grad()
+            total_actor_loss.backward()
+            nn.utils.clip_grad_norm_(actor.parameters(), cfg.max_grad_norm)
+            actor_optim.step()
+            
+            # --- CRITIC UPDATE ---
+            new_values = critic(mb_obs)
+            value_loss = 0.5 * ((new_values - mb_targets) ** 2).mean()
+            
+            # Backpropagation
+            critic_optim.zero_grad()
+            value_loss.backward()
+            nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
+            critic_optim.step()
+            
+            # Track metrics
+            total_p_loss += policy_loss.item()
+            total_v_loss += value_loss.item()
+            total_ent += entropy_loss.item()
+            
+    # Compute averages across all updates
+    num_updates = cfg.num_epochs * cfg.num_minibatches
+    return {
+        "policy_loss": total_p_loss / num_updates,
+        "value_loss": total_v_loss / num_updates,
+        "entropy": total_ent / num_updates
+    }
 
-    # Initialize Actor
-    actor_params = actor.init(rng_act, dummy_obs)
-    actor_tx = optax.chain(
-        optax.clip_by_global_norm(cfg.max_grad_norm),
-        optax.adamw(learning_rate=cfg.lr_actor, weight_decay=cfg.weight_decay)
-    )
-    actor_state = TrainState.create(apply_fn=actor.apply, params=actor_params, tx=actor_tx)
 
-    # Initialize Critic
-    critic_params = critic.init(rng_crit, dummy_obs)
-    critic_tx = optax.chain(
-        optax.clip_by_global_norm(cfg.max_grad_norm),
-        optax.adamw(learning_rate=cfg.lr_critic, weight_decay=cfg.weight_decay)
-    )
-    critic_state = TrainState.create(apply_fn=critic.apply, params=critic_params, tx=critic_tx)
-
-    return actor_state, critic_state
-
-
-# --- 5. Single PPO Iteration Step ---
+# --- 3. Single PPO Iteration Step ---
 
 def ppo_train_iteration(
-    env: Go2Env, env_state,
-    actor_state: TrainState, critic_state: TrainState,
+    envs, current_obs: np.ndarray, current_done: np.ndarray,
     actor: Actor, critic: Critic,
-    cfg: PPOConfig, rng: jax.Array, progress
-):
-    rng_rollout, rng_update = jax.random.split(rng)
-
-    # Step 1: Collect rollouts using lax.scan
-    (next_env_state, last_obs, _), trajectories = collect_rollouts(
-        env, env_state, actor, critic,
-        actor_state.params, critic_state.params,
-        rng_rollout, cfg.num_steps, progress
+    actor_optim: optim.Optimizer, critic_optim: optim.Optimizer,
+    cfg: PPOConfig, device: torch.device
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+    
+    # Step 1: Collect rollouts via Gymnasium Multiprocessing
+    next_obs, next_done, buffer = collect_rollouts(
+        envs, current_obs, current_done, actor, critic, cfg.num_steps, device
     )
 
     # Step 2: Value estimate for the very last step for GAE bootstrap
-    last_val = critic.apply(critic_state.params, last_obs)
+    with torch.no_grad():
+        next_obs_tensor = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
+        last_val = critic(next_obs_tensor)
 
     # Step 3: Compute GAE advantages & target returns
     advantages, targets = compute_gae(
-        trajectories, last_val, gamma=cfg.gamma, gae_lambda=cfg.gae_lambda
+        buffer.rewards, buffer.values, buffer.dones, last_val, gamma=cfg.gamma, gae_lambda=cfg.gae_lambda
     )
 
     # Step 4: Run multi-epoch minibatch PPO updates
-    new_actor_state, new_critic_state, metrics = update_epoch(
-        actor_state, critic_state, actor, critic,
-        trajectories, advantages, targets, cfg, rng_update
+    metrics = update_ppo(
+        actor, critic, actor_optim, critic_optim,
+        buffer, advantages, targets, cfg
     )
-    raw_mean_reward = jnp.mean(jnp.sum(trajectories.reward, axis=0))
-    total_crashes = jnp.sum(trajectories.is_crashed)
-    metrics["mean_reward"] = raw_mean_reward
-    metrics["total_crashes"] = total_crashes
     
-    return next_env_state, new_actor_state, new_critic_state, metrics
+    # Calculate environment metrics
+    # buffer.rewards shape: (num_steps, num_envs). Sum over steps, mean over envs.
+    raw_mean_reward = buffer.rewards.sum(dim=0).mean().item()
+    total_crashes = buffer.is_crashed.sum().item()
+    
+    metrics["mean_reward"] = raw_mean_reward
+    metrics["total_crashes"] = int(total_crashes)
+    
+    return next_obs, next_done, metrics
