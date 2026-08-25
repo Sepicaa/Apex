@@ -12,9 +12,9 @@ from src.training.networks import Actor, Critic
 from src.training.train_ppo import PPOConfig, create_train_states, ppo_train_iteration
 
 @partial(jax.jit, static_argnums=(0, 4, 5, 6))
-def compiled_train_step(env, env_state, actor_state, critic_state, actor, critic, cfg, rng):
+def compiled_train_step(env, env_state, actor_state, critic_state, actor, critic, cfg, rng, progress):
     return ppo_train_iteration(
-        env, env_state, actor_state, critic_state, actor, critic, cfg, rng
+        env, env_state, actor_state, critic_state, actor, critic, cfg, rng,progress
     )
 
 import os
@@ -32,7 +32,7 @@ def main():
     
     # 1. Setup Configuration 
     cfg = PPOConfig(
-        num_envs=32,
+        num_envs=16,
         num_steps=128,
         num_epochs=3,
         num_minibatches=8,
@@ -91,8 +91,11 @@ def main():
         
         # Execute the compiled monolithic training step
         # Note: The first iteration will pause to compile the graph.
+        
+        progress = jnp.array(i / total_iterations, dtype=jnp.float32)
+        
         env_state, actor_state, critic_state, metrics = compiled_train_step(
-            env, env_state, actor_state, critic_state, actor, critic, cfg, iter_rng
+            env, env_state, actor_state, critic_state, actor, critic, cfg, iter_rng, progress
         )
         
         step_time = time.time() - start_time
