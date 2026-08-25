@@ -1,44 +1,77 @@
-import jax
-import jax.numpy as jnp
-import flax.linen as nn
-import numpy as np # For sqrt
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.distributions.normal import Normal
+
+def layer_init(layer, std=np.sqrt(2.0), bias_const=0.0):
+    """Initializes linear layers with orthogonal weights to match the JAX implementation."""
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
 
 class Actor(nn.Module):
-    action_dim: int
-
-    @nn.compact
-    def __call__(self, x):
-        # Hidden layers with sqrt(2) scaling
-        init_hidden = nn.initializers.orthogonal(np.sqrt(2.0))
+    def __init__(self, obs_dim: int, action_dim: int):
+        super(Actor, self).__init__()
         
-        x = nn.Dense(512, kernel_init=init_hidden)(x)
-        x = nn.tanh(x)
-        x = nn.Dense(256, kernel_init=init_hidden)(x)
-        x = nn.tanh(x)
-        x = nn.Dense(256, kernel_init=init_hidden)(x)
-        x = nn.tanh(x)
+        # Hidden layers with sqrt(2) scaling
+        self.net = nn.Sequential(
+            layer_init(nn.Linear(obs_dim, 512)),
+            nn.Tanh(),
+            layer_init(nn.Linear(512, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+        )
         
         # Output layer with 0.01 scaling
-        mean = nn.Dense(
-            self.action_dim, 
-            kernel_init=nn.initializers.orthogonal(0.01)
-        )(x)
+        self.mean_layer = layer_init(nn.Linear(256, action_dim), std=0.01)
         
-        log_std = self.param('log_std', nn.initializers.zeros, (self.action_dim,))
-        return mean, log_std
+        # Learnable standard deviation parameter (initialized to zeros)
+        self.log_std = nn.Parameter(torch.zeros(1, action_dim))
+
+    def forward(self, x):
+        hidden = self.net(x)
+        mean = self.mean_layer(hidden)
+        # We return mean and log_std to perfectly match your JAX signature
+        return mean, self.log_std
+    
+    def get_action(self, x, action=None):
+        """Helper method to sample actions and compute log probabilities for PPO."""
+        mean, log_std = self.forward(x)
+        
+        # Expand log_std to match the batch dimension of the mean and calculate std
+        std = torch.exp(log_std.expand_as(mean))
+        dist = Normal(mean, std)
+        
+        if action is None:
+            action = dist.sample()
+            
+        # Sum log probabilities across the action dimensions for continuous control
+        log_prob = dist.log_prob(action).sum(axis=-1)
+        entropy = dist.entropy().sum(axis=-1)
+        
+        return action, log_prob, entropy
+
 
 class Critic(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        init_hidden = nn.initializers.orthogonal(np.sqrt(2.0))
+    def __init__(self, obs_dim: int):
+        super(Critic, self).__init__()
         
-        x = nn.Dense(512, kernel_init=init_hidden)(x)
-        x = nn.tanh(x)
-        x = nn.Dense(256, kernel_init=init_hidden)(x)
-        x = nn.tanh(x)
-        x = nn.Dense(256, kernel_init=init_hidden)(x)
-        x = nn.tanh(x)
+        # Hidden layers with sqrt(2) scaling
+        self.net = nn.Sequential(
+            layer_init(nn.Linear(obs_dim, 512)),
+            nn.Tanh(),
+            layer_init(nn.Linear(512, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+        )
         
         # Critic output with standard 1.0 scaling
-        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(x)
-        return jnp.squeeze(value, axis=-1)
+        self.value_layer = layer_init(nn.Linear(256, 1), std=1.0)
+
+    def forward(self, x):
+        hidden = self.net(x)
+        value = self.value_layer(hidden)
+        # Squeeze the final dimension to output a scalar per batch item
+        return value.squeeze(-1)
