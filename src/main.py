@@ -42,7 +42,7 @@ def main():
     rng = jax.random.PRNGKey(42)
     rng, rng_env, rng_init = jax.random.split(rng, 3)
 
-    xml_path = "third_party/mujoco_menagerie/unitree_go2/scene.xml"
+    xml_path = "third_party/mujoco_menagerie/unitree_go2/scene_mjx.xml"
     env = Go2Env(xml_path=xml_path)
     
     env = EpisodeWrapper(env, episode_length=1000, action_repeat=2) 
@@ -83,7 +83,7 @@ def main():
     
     # Running tallies for the 64 parallel environments
     running_returns = np.zeros(cfg.num_envs)
-    running_crashes = np.zeros(cfg.num_envs)
+    running_steps = np.zeros(cfg.num_envs)
 
     global_start_time = time.time()
     
@@ -102,25 +102,27 @@ def main():
         # 1. Convert JAX arrays to NumPy for Python-side iteration
         step_rewards = np.array(metrics["step_rewards"])
         step_dones = np.array(metrics["step_dones"])
-        step_crashes = np.array(metrics["step_crashes"])
         
         # 2. Accumulate metrics step-by-step
         for t in range(cfg.num_steps):
             running_returns += step_rewards[t]
-            running_crashes += step_crashes[t]
+            running_steps += 1
             
             dones_at_t = step_dones[t]
             if np.any(dones_at_t):
                 # Identify which specific environments finished
                 finished_envs = dones_at_t > 0.5
                 
+                # A fall is any episode that terminates before the 1000-step timeout
+                falls = (running_steps[finished_envs] < 1000).astype(float)
+                
                 # Push the completed episode totals to our rolling queues
                 ep_return_queue.extend(running_returns[finished_envs].tolist())
-                ep_crash_queue.extend(running_crashes[finished_envs].tolist())
+                ep_crash_queue.extend(falls.tolist())
                 
                 # Reset the running tally for those specific environments
                 running_returns[finished_envs] = 0.0
-                running_crashes[finished_envs] = 0.0
+                running_steps[finished_envs] = 0.0
                 
         # 3. Calculate rolling averages
         mean_reward = np.mean(ep_return_queue) if len(ep_return_queue) > 0 else 0.0

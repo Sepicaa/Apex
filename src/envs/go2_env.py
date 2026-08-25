@@ -189,4 +189,4 @@ class Go2Env(PipelineEnv):
             r_alive
         )
         
-        return jnp.clip(total_reward, -5.0, 10.0)
+        return jnp.clip(total_reward, -5.0, 10.0) * 0.02
