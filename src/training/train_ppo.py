@@ -186,7 +186,7 @@ def ppo_train_iteration(
     env: Go2Env, env_state,
     actor_state: TrainState, critic_state: TrainState,
     actor: Actor, critic: Critic,
-    cfg: PPOConfig, rng: jax.Array
+    cfg: PPOConfig, rng: jax.Array, progress
 ):
     rng_rollout, rng_update = jax.random.split(rng)
 
@@ -194,7 +194,7 @@ def ppo_train_iteration(
     (next_env_state, last_obs, _), trajectories = collect_rollouts(
         env, env_state, actor, critic,
         actor_state.params, critic_state.params,
-        rng_rollout, cfg.num_steps
+        rng_rollout, cfg.num_steps, progress
     )
 
     # Step 2: Value estimate for the very last step for GAE bootstrap

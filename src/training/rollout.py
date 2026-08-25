@@ -13,7 +13,7 @@ class Transition(NamedTuple):
     log_prob: jax.Array
     is_crashed: jax.Array
 
-def collect_rollouts(env, env_state, actor, critic, actor_params, critic_params, rng, num_steps):
+def collect_rollouts(env, env_state, actor, critic, actor_params, critic_params, rng, num_steps, progress):
     
     def _step(runner_state, _):
         current_env_state, last_obs, key = runner_state
@@ -35,6 +35,8 @@ def collect_rollouts(env, env_state, actor, critic, actor_params, critic_params,
         )
         
         # 3. Environment Step
+        new_info = {**current_env_state.info, "progress": jnp.full_like(current_env_state.done, progress)}
+        current_env_state = current_env_state.replace(info=new_info)
         next_env_state = env.step(current_env_state, action_clipped)
         is_crashed = next_env_state.info.get("is_crashed", jnp.zeros_like(next_env_state.done))
         # 4. Store the Transition

@@ -105,7 +105,8 @@ class Go2Env(PipelineEnv):
             "commands": initial_commands,
             "target_sit_pose": target_sit_pose,
             "step_count": jnp.array(0),
-            "is_crashed": jnp.array(0.0)
+            "is_crashed": jnp.array(0.0),
+            "progress": jnp.array(0.0)
         }
         
         return State(
@@ -122,6 +123,8 @@ class Go2Env(PipelineEnv):
         # Allow +/- 0.8 rad (~45.8 deg) deviation so sitting/turning poses are reachable
         action_scaled = action * 0.8
         target_angles = self.q_nom + action_scaled
+        
+        progress = state.info["progress"]
         
         # --- 2. Physics Simulation ---
         pipeline_state = self.pipeline_step(state.pipeline_state, target_angles)
@@ -142,7 +145,7 @@ class Go2Env(PipelineEnv):
         
         # --- 4. Termination Condition ---
         is_flipped = g_proj[2] > 0.0
-        is_bottomed_out = z_height < 0.13
+        is_bottomed_out = z_height < 0.20
         is_crashed_bool = jnp.logical_or(is_flipped, is_bottomed_out)
         
         done = jnp.where(is_crashed_bool, 1.0, 0.0)
@@ -150,7 +153,7 @@ class Go2Env(PipelineEnv):
         # --- 5. Reward Calculation ---
         reward = self._calc_reward(
             v_base, omega_base, action, last_action, 
-            commands, g_proj, z_height, q_joints, target_sit_pose, is_crashed_bool
+            commands, g_proj, z_height, q_joints, target_sit_pose, is_crashed_bool, progress
         )
         
         # --- 6. Next Observation & Memory Update ---
@@ -170,34 +173,35 @@ class Go2Env(PipelineEnv):
         )
 
     def _calc_reward(self, v_base: jax.Array, omega_base: jax.Array, 
-                     action: jax.Array, last_action: jax.Array, 
-                     commands: jax.Array, g_proj: jax.Array, 
-                     z_height: jax.Array, q_joints: jax.Array, 
-                     target_sit_pose: jax.Array, has_crashed: jax.Array) -> jax.Array:
-                     
-        # 1. Alive Bonus (+1.0 when upright, 0.0 on crash)
-        r_alive = jnp.where(has_crashed, 0.0, 1.0)
+                    action: jax.Array, last_action: jax.Array, 
+                    commands: jax.Array, g_proj: jax.Array, 
+                    z_height: jax.Array, q_joints: jax.Array, 
+                    target_sit_pose: jax.Array, has_crashed: jax.Array,
+                    progress: jax.Array) -> jax.Array:
+                    
+        # 1. Alive Bonus (Always active)
+        is_upright = (g_proj[2] < -0.85) & (z_height > 0.22)
+        r_alive = jnp.where(is_upright & ~has_crashed, 0.5, 0.0)
 
-        # 2. Task Rewards
-        is_sitting_cmd = commands[3]
+        # 2. Stage 1: Standing Objective (Active early, fades out)
+        # Penalize moving away from the default standing joint angles
+        stand_error = jnp.sum(jnp.square(q_joints - self.q_nom))
+        r_stand = jnp.exp(-stand_error / 0.1) * 2.0
         
-        # Branch A: Sitting Imitation
-        sit_joint_error = jnp.sum(jnp.square(q_joints - target_sit_pose))
-        sit_height_error = jnp.square(z_height - 0.22) * 50.0 
-        sit_upright_error = jnp.square(g_proj[2] - (-1.0)) * 10.0
-        sit_vel_error = jnp.sum(jnp.square(v_base)) + jnp.sum(jnp.square(omega_base))
-        
-        total_sit_error = sit_joint_error + sit_height_error + sit_upright_error + sit_vel_error
-        r_sit = jnp.exp(-total_sit_error) * 2.0
-        
-        # Branch B: Locomotion Tracking
+        # 3. Stage 2: Walking Objective (Fades in after 20% progress)
         linear_error = jnp.sum(jnp.square(v_base[:2] - commands[:2]))
         angular_error = jnp.square(omega_base[2] - commands[2])
-        r_tracking = jnp.exp(-linear_error) + jnp.exp(-angular_error)
+        r_walk = 2.0 * jnp.exp(-linear_error / 0.25) + 1.0 * jnp.exp(-angular_error / 0.25)
         
-        r_task = jnp.where(is_sitting_cmd == 1.0, r_sit, r_tracking)
+        # 4. Stage 3: Good Form Regularization (Fades in after 70% progress)
+        r_smooth = -jnp.sum(jnp.square(action - last_action)) * 0.05
         
-        # 3. Action Smoothness Regularization (Mild penalty to avoid overwhelming exploration)
-        r_smooth = -jnp.sum(jnp.square(action - last_action)) * 0.01
+        # --- The Continuous JAX Curriculum Logic ---
         
-        return r_alive + r_task + r_smooth
+        # If progress < 0.2, rely heavily on r_stand. Otherwise, rely on r_walk.
+        task_reward = jnp.where(progress < 0.2, r_stand, r_walk)
+        
+        # Only apply the smoothness penalty in the final 30% of training
+        style_penalty = jnp.where(progress > 0.7, r_smooth, 0.0)
+        
+        return r_alive + task_reward + style_penalty
