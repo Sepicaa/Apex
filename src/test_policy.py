@@ -9,7 +9,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-from src.networks.actor_critic import Actor
+from src.training.networks import Actor
 
 # --- Shared Command State ---
 class InteractiveCommandState:

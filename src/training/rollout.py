@@ -73,7 +73,7 @@ def collect_rollouts(
         values_buffer[step] = value_tensor
         log_probs_buffer[step] = log_prob_tensor
         rewards_buffer[step] = torch.as_tensor(rewards, dtype=torch.float32, device=device)
-        dones_buffer[step] = done_tensor
+        dones_buffer[step] = torch.as_tensor(dones, dtype=torch.float32, device=device)
         crashed_buffer[step] = torch.as_tensor(is_crashed, dtype=torch.float32, device=device)
 
         # 5. Advance State
