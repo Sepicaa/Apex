@@ -7,90 +7,85 @@ from brax.io import mjcf
 from mujoco import mjx, mjtGeom
 
 class Go2Env(PipelineEnv):
-    def __init__(self, xml_path: str, terrain_mode: str = "flat", **kwargs):
-        # 1. Load raw MuJoCo C-model
+    def __init__(self, xml_path: str = "third_party/mujoco_menagerie/unitree_go2/scene_mjx.xml", **kwargs):
         mj_model = mujoco.MjModel.from_xml_path(xml_path)
         
-        # 2. Patch CYLINDER to CAPSULE to prevent MJX compilation errors
         for i in range(mj_model.ngeom):
             if mj_model.geom_type[i] == mjtGeom.mjGEOM_CYLINDER:
                 mj_model.geom_type[i] = mjtGeom.mjGEOM_CAPSULE
                 
-        # 3. Patch friction cone to Pyramidal (MJX compatibility)
         mj_model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
-                
-        # 4. Pass patched model to Brax
         sys = mjcf.load_model(mj_model)
         
-        self.terrain_mode = terrain_mode
-        
-        # Nominal standing posture (rad)
         self.q_nom = jnp.array([
-             0.1,  0.8, -1.5,  # Front Right
-            -0.1,  0.8, -1.5,  # Front Left
-             0.1,  1.0, -1.5,  # Rear Right
-            -0.1,  1.0, -1.5   # Rear Left
+            0.0, 0.9, -1.8,  # Front Left
+            0.0, 0.9, -1.8,  # Front Right
+            0.0, 0.9, -1.8,  # Rear Left
+            0.0, 0.9, -1.8   # Rear Right
         ])
         
-        # Removed the sit_dataset and q_master_sit arrays since 
-        # the task is now purely continuous locomotion.
+        # User requested: Action scale of 0.5 for wider control authority
+        self.action_scale = 0.5  
+        self.target_height = 0.28 
 
-        super().__init__(sys, backend='mjx', n_frames=10, **kwargs)
+        super().__init__(sys, backend='mjx', n_frames=5, **kwargs)
 
     def _get_obs(self, data: mjx.Data, action: jax.Array, commands: jax.Array) -> jax.Array:
-        v_base = data.qvel[:3]
-        omega_base = data.qvel[3:6]
-        
         quat = data.qpos[3:7]
-        g_proj = math.rotate(jnp.array([0.0, 0.0, -1.0]), math.quat_inv(quat))
+        inv_quat = math.quat_inv(quat)
+        
+        v_local = math.rotate(data.qvel[:3], inv_quat)
+        omega_local = math.rotate(data.qvel[3:6], inv_quat)
+        g_proj = math.rotate(jnp.array([0.0, 0.0, -1.0]), inv_quat)
         
         q_joints = data.qpos[7:19]
         dq_joints = data.qvel[6:18]
         
         return jnp.concatenate([
-            v_base,
-            omega_base,
-            g_proj,
-            q_joints - self.q_nom,
-            dq_joints,
-            action,
-            commands  # 3D command: [v_x, v_y, omega_z] (Total: 48D)
-        ])
+            v_local,                 
+            omega_local,             
+            g_proj,                  
+            q_joints - self.q_nom,   
+            dq_joints * 0.05,        
+            action,                  
+            commands                 
+        ])                           
 
     def reset(self, rng: jax.Array) -> State:
-        rng, rng_pos, rng_vel, rng_cmd, rng_sit = jax.random.split(rng, 5)
+        rng, rng_noise, rng_speed, rng_angle, rng_yaw = jax.random.split(rng, 5)
         
-        # Add slight initial posture perturbation
-        qpos = self.sys.qpos0 + jax.random.uniform(
-            rng_pos, (self.sys.nq,), minval=-0.01, maxval=0.01
-        )
-        qpos = qpos.at[7:19].set(self.q_nom + jax.random.uniform(
-            rng_pos, (12,), minval=-0.05, maxval=0.05
-        ))
-        
-        qvel = jax.random.uniform(
-            rng_vel, (self.sys.nv,), minval=-0.01, maxval=0.01
+        qpos = self.sys.qpos0
+        qpos = qpos.at[2].set(self.target_height)
+        qpos = qpos.at[7:19].set(
+            self.q_nom + jax.random.uniform(rng_noise, (12,), minval=-0.05, maxval=0.05)
         )
         
+        qvel = jnp.zeros(self.sys.nv)
         pipeline_state = self.pipeline_init(qpos, qvel)
+        
+        # --- ADVANCED COMMAND SAMPLING LOGIC ---
+        # 1. Base translation speed and heading
+        speed = jax.random.uniform(rng_speed, (), minval=0.0, maxval=1.2)
+        # Favor forward motion, but allow slight diagonal/sideways walking
+        angle = jax.random.uniform(rng_angle, (), minval=-0.5, maxval=0.5) 
+        
+        v_x = speed * jnp.cos(angle)
+        v_y = speed * jnp.sin(angle)
+        
+        # 2. Coupled Yaw: As linear speed approaches 1.2 m/s, maximum yaw shrinks to near 0.
+        raw_yaw = jax.random.uniform(rng_yaw, (), minval=-1.0, maxval=1.0)
+        speed_penalty = (speed / 1.2) * 0.85 # Scales up to 0.85 at max speed
+        omega_z = raw_yaw * (1.0 - speed_penalty)
+        
+        commands = jnp.array([v_x, v_y, omega_z])
+        
         initial_action = jnp.zeros(12)
+        obs = self._get_obs(pipeline_state, initial_action, commands)
         
-        # Command Sampling (Removed 'is_sitting', focusing purely on locomotion)
-        angle = jax.random.uniform(rng_cmd, minval=-jnp.pi, maxval=jnp.pi)
-        speed = jax.random.uniform(rng_cmd, minval=0.0, maxval=1.0)
-        v_x = jnp.cos(angle) * speed
-        v_y = jnp.sin(angle) * speed
-        omega_z = jax.random.uniform(rng_cmd, minval=-0.5, maxval=0.5)
-
-        initial_commands = jnp.array([v_x, v_y, omega_z])
-        
-        obs = self._get_obs(pipeline_state, initial_action, initial_commands)
-        
-        # Removed the buggy "progress" tracking
         info = {
             "last_action": initial_action,
-            "commands": initial_commands,
-            "step_count": jnp.array(0),
+            "commands": commands,
+            "step_count": jnp.array(0, dtype=jnp.int32),
             "is_crashed": jnp.array(0.0),
         }
         
@@ -104,40 +99,42 @@ class Go2Env(PipelineEnv):
         )
 
     def step(self, state: State, action: jax.Array) -> State:
-        # --- 1. Action Scaling (The Sweet Spot) ---
-        # Reverted to 0.5 to prevent violent twitches per Hugging Face spec
-        action_scaled = action * 0.5
-        target_angles = self.q_nom + action_scaled
-        
-        # --- 2. Physics Simulation ---
-        pipeline_state = self.pipeline_step(state.pipeline_state, target_angles)
+        target_qpos = self.q_nom + action * self.action_scale
+        pipeline_state = self.pipeline_step(state.pipeline_state, target_qpos)
         data = pipeline_state
         
-        # --- 3. Extract Kinematics ---
-        v_base = data.qvel[:3]
-        omega_base = data.qvel[3:6]
-        z_height = data.qpos[2]
-        
         quat = data.qpos[3:7]
-        g_proj = math.rotate(jnp.array([0.0, 0.0, -1.0]), math.quat_inv(quat))
+        inv_quat = math.quat_inv(quat)
         
+        v_local = math.rotate(data.qvel[:3], inv_quat)
+        omega_local = math.rotate(data.qvel[3:6], inv_quat)
+        g_proj = math.rotate(jnp.array([0.0, 0.0, -1.0]), inv_quat)
+        
+        base_z = data.qpos[2]
         commands = state.info["commands"]
         last_action = state.info["last_action"]
         
-        # --- 4. Termination Condition ---
-        is_flipped = g_proj[2] > 0.0
-        is_bottomed_out = z_height < 0.20
-        is_crashed_bool = jnp.logical_or(is_flipped, is_bottomed_out)
+        # --- SENSOR EXTRACTION ---
+        # Foot contacts: index -9 to -6 (FL, FR, RL, RR from go2_mjx.xml)
+        foot_forces = data.sensordata[-9:-5]
+        num_feet_touching = jnp.sum(foot_forces > 0.1)
         
-        done = jnp.where(is_crashed_bool, 1.0, 0.0)
+        # Illegal contacts: index -5 to end (belly + 4 thighs)
+        has_illegal_touch = jnp.any(data.sensordata[-5:] > 0.1)
         
-        # --- 5. Reward Calculation ---
+        # --- TERMINATION LOGIC ---
+        is_inverted = g_proj[2] > -0.4  # Tilted beyond ~65 degrees
+        # Note: is_bottomed checking base_z was completely removed as requested!
+        
+        is_crashed = jnp.logical_or(is_inverted, has_illegal_touch)
+        done = jnp.where(is_crashed, 1.0, 0.0)
+        
         reward = self._calc_reward(
-            v_base, omega_base, action, last_action, 
-            commands, g_proj, is_crashed_bool
+            v_local, omega_local, g_proj, base_z,
+            data.qpos[7:19], data.qvel[6:18],
+            action, last_action, commands, is_crashed, num_feet_touching
         )
         
-        # --- 6. Next Observation & Memory Update ---
         obs = self._get_obs(pipeline_state, action, commands)
         
         info = state.info
@@ -153,31 +150,43 @@ class Go2Env(PipelineEnv):
             info=info
         )
 
-    def _calc_reward(self, v_base: jax.Array, omega_base: jax.Array, 
-                     action: jax.Array, last_action: jax.Array, 
-                     commands: jax.Array, g_proj: jax.Array, 
-                     has_crashed: jax.Array) -> jax.Array:
-                     
-        # 1. Positive Tracking Rewards (Exp scale so max is 1.0)
-        linear_error = jnp.sum(jnp.square(v_base[:2] - commands[:2]))
-        angular_error = jnp.square(omega_base[2] - commands[2])
+    def _calc_reward(
+        self, v_local, omega_local, g_proj, base_z,
+        q_joints, dq_joints, action, last_action,
+        commands, is_crashed, num_feet_touching
+    ) -> jax.Array:
         
-        r_lin_track = jnp.exp(-linear_error / 0.25) * 1.0
-        r_ang_track = jnp.exp(-angular_error / 0.25) * 1.0
+        lin_vel_error = jnp.sum(jnp.square(v_local[:2] - commands[:2]))
+        r_lin_vel = jnp.exp(-lin_vel_error / 0.25) * 1.5
         
-        # 2. Huge Crash Penalty
-        r_crash = jnp.where(has_crashed, -200.0, 0.0)
+        ang_vel_error = jnp.square(omega_local[2] - commands[2])
+        r_ang_vel = jnp.exp(-ang_vel_error / 0.25) * 0.8
         
-        # 3. Flat Orientation Penalty (Penalize tilt away from z-axis)
-        r_flat = -jnp.sum(jnp.square(g_proj[:2])) * 5.0
+        r_z_vel = -jnp.square(v_local[2]) * 1.0
+        r_ang_rates = -jnp.sum(jnp.square(omega_local[:2])) * 0.05
+        r_flat_posture = -jnp.sum(jnp.square(g_proj[:2])) * 2.5
+        r_height = -jnp.square(base_z - self.target_height) * 10.0
+        r_action_rate = -jnp.sum(jnp.square(action - last_action)) * 0.02
+        r_joint_vel = -jnp.sum(jnp.square(dq_joints)) * 0.0001
+        r_joint_nominal = -jnp.sum(jnp.square(q_joints - self.q_nom)) * 0.02
         
-        # 4. Action Rate L2 (Smoothness penalty)
-        r_action_rate = -jnp.sum(jnp.square(action - last_action)) * 0.05
+        # User requested: Tiny penalty if 0 paws are touching the ground
+        r_airborne = jnp.where(num_feet_touching == 0, -0.2, 0.0)
         
-        # Sum everything
-        total_reward = r_lin_track + r_ang_track + r_crash + r_flat + r_action_rate
+        r_alive = jnp.where(is_crashed, -1.0, 0.5)
         
-        # --- THE MAGIC BULLET: SCALE BY DT ---
-        # Assuming a step_dt of roughly 0.02 seconds
-        dt = 0.02
-        return total_reward * dt
+        total_reward = (
+            r_lin_vel +
+            r_ang_vel +
+            r_z_vel +
+            r_ang_rates +
+            r_flat_posture +
+            r_height +
+            r_action_rate +
+            r_joint_vel +
+            r_joint_nominal +
+            r_airborne +
+            r_alive
+        )
+        
+        return jnp.clip(total_reward, -5.0, 10.0)
