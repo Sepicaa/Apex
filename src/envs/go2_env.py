@@ -41,7 +41,7 @@ class Go2Env(PipelineEnv):
         q_joints = data.qpos[7:19]
         dq_joints = data.qvel[6:18]
         
-        return jnp.concatenate([
+        obs = jnp.concatenate([
             v_local,                 
             omega_local,             
             g_proj,                  
@@ -49,7 +49,10 @@ class Go2Env(PipelineEnv):
             dq_joints * 0.05,        
             action,                  
             commands                 
-        ])                           
+        ])
+        # --- FIX 1: Clip extremes and wipe any hidden NaNs ---
+        obs = jnp.clip(obs, -10.0, 10.0)
+        return jnp.nan_to_num(obs)                
 
     def reset(self, rng: jax.Array) -> State:
         rng, rng_noise, rng_speed, rng_angle, rng_yaw = jax.random.split(rng, 5)
@@ -114,19 +117,20 @@ class Go2Env(PipelineEnv):
         commands = state.info["commands"]
         last_action = state.info["last_action"]
         
-        # --- SENSOR EXTRACTION ---
-        # Foot contacts: index -9 to -6 (FL, FR, RL, RR from go2_mjx.xml)
+        # --- FIX 2: Detect Physics Explosions ---
+        # If the solver diverged, qvel or qpos will contain NaNs
+        has_nans = jnp.any(jnp.isnan(data.qvel)) | jnp.any(jnp.isnan(data.qpos))
+        
         foot_forces = data.sensordata[-9:-5]
         num_feet_touching = jnp.sum(foot_forces > 0.1)
-        
-        # Illegal contacts: index -5 to end (belly + 4 thighs)
         has_illegal_touch = jnp.any(data.sensordata[-5:] > 0.1)
         
-        # --- TERMINATION LOGIC ---
-        is_inverted = g_proj[2] > -0.4  # Tilted beyond ~65 degrees
-        # Note: is_bottomed checking base_z was completely removed as requested!
+        is_inverted = g_proj[2] > -0.4 
         
+        # Treat a physics explosion exactly like a fatal crash
         is_crashed = jnp.logical_or(is_inverted, has_illegal_touch)
+        is_crashed = jnp.logical_or(is_crashed, has_nans)
+        
         done = jnp.where(is_crashed, 1.0, 0.0)
         
         reward = self._calc_reward(
@@ -134,6 +138,10 @@ class Go2Env(PipelineEnv):
             data.qpos[7:19], data.qvel[6:18],
             action, last_action, commands, is_crashed, num_feet_touching
         )
+        
+        # --- FIX 3: Sanitize the Reward ---
+        # Mathematical operations on a NaN state result in a NaN reward. Overwrite it.
+        reward = jnp.where(has_nans, -1.0, reward)
         
         obs = self._get_obs(pipeline_state, action, commands)
         

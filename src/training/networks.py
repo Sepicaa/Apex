@@ -25,6 +25,7 @@ class Actor(nn.Module):
         )(x)
         
         log_std = self.param('log_std', nn.initializers.zeros, (self.action_dim,))
+        log_std = jnp.clip(log_std, -100.0, 10.0)
         return mean, log_std
 
 class Critic(nn.Module):
