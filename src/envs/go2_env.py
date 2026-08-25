@@ -1,197 +1,192 @@
-import gymnasium as gym
-import numpy as np
+import jax
+import jax.numpy as jnp
 import mujoco
+from brax import math
+from brax.envs.base import PipelineEnv, State
+from brax.io import mjcf
+from mujoco import mjx, mjtGeom
 
-class Go2Env(gym.Env):
-    def __init__(self, xml_path: str = "third_party/mujoco_menagerie/unitree_go2/scene.xml", terrain_mode: str = "flat"):
-        super().__init__()
+class Go2Env(PipelineEnv):
+    def __init__(self, xml_path: str = "third_party/mujoco_menagerie/unitree_go2/scene_mjx.xml", **kwargs):
+        mj_model = mujoco.MjModel.from_xml_path(xml_path)
         
-        # 1. Load standard MuJoCo Model[cite: 1]
-        self.model = mujoco.MjModel.from_xml_path(xml_path)
-        
-        # 2. Modify Geometry and Friction Properties (Cylinder -> Capsule)
-        for i in range(self.model.ngeom):
-            if self.model.geom_type[i] == mujoco.mjtGeom.mjGEOM_CYLINDER:
-                self.model.geom_type[i] = mujoco.mjtGeom.mjGEOM_CAPSULE
+        for i in range(mj_model.ngeom):
+            if mj_model.geom_type[i] == mjtGeom.mjGEOM_CYLINDER:
+                mj_model.geom_type[i] = mjtGeom.mjGEOM_CAPSULE
                 
-        self.model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
+        mj_model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
+        sys = mjcf.load_model(mj_model)
         
-        # Initialize Data object[cite: 1]
-        self.data = mujoco.MjData(self.model)
-        
-        # Control frequency: 5 substeps (matches n_frames=5 in JAX)
-        self.n_frames = 5
-        self.dt = self.model.opt.timestep * self.n_frames
-        
-        # 3. Define Gymnasium Spaces (48D Obs, 12D Action)[cite: 1]
-        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(48,), dtype=np.float32)
-        
-        # Updated nominal posture (FL, FR, RL, RR)
-        self.q_nom = np.array([
+        self.q_nom = jnp.array([
             0.0, 0.9, -1.8,  # Front Left
             0.0, 0.9, -1.8,  # Front Right
             0.0, 0.9, -1.8,  # Rear Left
             0.0, 0.9, -1.8   # Rear Right
-        ], dtype=np.float32)
+        ])
         
+        # User requested: Action scale of 0.5 for wider control authority
         self.action_scale = 0.5  
         self.target_height = 0.28 
 
-        self.last_action = np.zeros(12, dtype=np.float32)
-        self.commands = np.zeros(3, dtype=np.float32)
-        self.step_count = 0
+        super().__init__(sys, backend='mjx', n_frames=5, **kwargs)
 
-    def _quat_rotate_inverse(self, q, v):
-        """Rotates a world-frame vector into the local body frame using the inverse quaternion."""
-        w, x, y, z = q[0], -q[1], -q[2], -q[3]
-        q_vec = np.array([x, y, z], dtype=np.float32)
-        uv = np.cross(q_vec, v)
-        uuv = np.cross(q_vec, uv)
-        return v + 2.0 * (w * uv + uuv)
+    def _get_obs(self, data: mjx.Data, action: jax.Array, commands: jax.Array) -> jax.Array:
+        quat = data.qpos[3:7]
+        inv_quat = math.quat_inv(quat)
+        
+        v_local = math.rotate(data.qvel[:3], inv_quat)
+        omega_local = math.rotate(data.qvel[3:6], inv_quat)
+        g_proj = math.rotate(jnp.array([0.0, 0.0, -1.0]), inv_quat)
+        
+        q_joints = data.qpos[7:19]
+        dq_joints = data.qvel[6:18]
+        
+        return jnp.concatenate([
+            v_local,                 
+            omega_local,             
+            g_proj,                  
+            q_joints - self.q_nom,   
+            dq_joints * 0.05,        
+            action,                  
+            commands                 
+        ])                           
 
-    def _get_obs(self) -> np.ndarray:
-        quat = self.data.qpos[3:7].copy()
+    def reset(self, rng: jax.Array) -> State:
+        rng, rng_noise, rng_speed, rng_angle, rng_yaw = jax.random.split(rng, 5)
         
-        # Transform velocities to local frame
-        v_world = self.data.qvel[:3].copy()
-        omega_world = self.data.qvel[3:6].copy()
-        v_local = self._quat_rotate_inverse(quat, v_world)
-        omega_local = self._quat_rotate_inverse(quat, omega_world)
+        qpos = self.sys.qpos0
+        qpos = qpos.at[2].set(self.target_height)
+        qpos = qpos.at[7:19].set(
+            self.q_nom + jax.random.uniform(rng_noise, (12,), minval=-0.05, maxval=0.05)
+        )
         
-        # Gravity projection
-        g_world = np.array([0.0, 0.0, -1.0], dtype=np.float32)
-        g_proj = self._quat_rotate_inverse(quat, g_world)
-        
-        q_joints = self.data.qpos[7:19].copy()
-        dq_joints = self.data.qvel[6:18].copy()
-        
-        obs = np.concatenate([
-            v_local,
-            omega_local,
-            g_proj,
-            q_joints - self.q_nom,
-            dq_joints * 0.05,
-            self.last_action,
-            self.commands
-        ]).astype(np.float32)
-        
-        return obs
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        mujoco.mj_resetData(self.model, self.data)
-        
-        # Apply initial posture noise
-        qpos = self.model.qpos0.copy()
-        qpos[2] = self.target_height
-        qpos[7:19] = self.q_nom + self.np_random.uniform(-0.05, 0.05, size=12)
-        
-        qvel = np.zeros(self.model.nv, dtype=np.float32)
-        
-        self.data.qpos[:] = qpos
-        self.data.qvel[:] = qvel
-        mujoco.mj_forward(self.model, self.data)
-        
-        self.last_action = np.zeros(12, dtype=np.float32)
-        self.step_count = 0
+        qvel = jnp.zeros(self.sys.nv)
+        pipeline_state = self.pipeline_init(qpos, qvel)
         
         # --- ADVANCED COMMAND SAMPLING LOGIC ---
-        speed = self.np_random.uniform(0.0, 1.2)
-        angle = self.np_random.uniform(-0.5, 0.5)
+        # 1. Base translation speed and heading
+        speed = jax.random.uniform(rng_speed, (), minval=0.0, maxval=1.2)
+        # Favor forward motion, but allow slight diagonal/sideways walking
+        angle = jax.random.uniform(rng_angle, (), minval=-0.5, maxval=0.5) 
         
-        v_x = speed * np.cos(angle)
-        v_y = speed * np.sin(angle)
+        v_x = speed * jnp.cos(angle)
+        v_y = speed * jnp.sin(angle)
         
-        raw_yaw = self.np_random.uniform(-1.0, 1.0)
-        speed_penalty = (speed / 1.2) * 0.85
+        # 2. Coupled Yaw: As linear speed approaches 1.2 m/s, maximum yaw shrinks to near 0.
+        raw_yaw = jax.random.uniform(rng_yaw, (), minval=-1.0, maxval=1.0)
+        speed_penalty = (speed / 1.2) * 0.85 # Scales up to 0.85 at max speed
         omega_z = raw_yaw * (1.0 - speed_penalty)
         
-        self.commands = np.array([v_x, v_y, omega_z], dtype=np.float32)
+        commands = jnp.array([v_x, v_y, omega_z])
+        
+        initial_action = jnp.zeros(12)
+        obs = self._get_obs(pipeline_state, initial_action, commands)
         
         info = {
-            "is_crashed": False,
-            "commands": self.commands.copy()
+            "last_action": initial_action,
+            "commands": commands,
+            "step_count": jnp.array(0, dtype=jnp.int32),
+            "is_crashed": jnp.array(0.0),
         }
-        return self._get_obs(), info
+        
+        return State(
+            pipeline_state=pipeline_state,
+            obs=obs,
+            reward=jnp.array(0.0),
+            done=jnp.array(0.0),
+            metrics={},
+            info=info
+        )
 
-    def step(self, action: np.ndarray):
-        # Action Scaling
-        target_angles = self.q_nom + (action * self.action_scale)
+    def step(self, state: State, action: jax.Array) -> State:
+        target_qpos = self.q_nom + action * self.action_scale
+        pipeline_state = self.pipeline_step(state.pipeline_state, target_qpos)
+        data = pipeline_state
         
-        # Standard CPU MuJoCo Control Loop[cite: 1]
-        self.data.ctrl[:] = target_angles
-        for _ in range(self.n_frames):
-            mujoco.mj_step(self.model, self.data)
-            
-        # Kinematics & States
-        quat = self.data.qpos[3:7].copy()
-        v_world = self.data.qvel[:3].copy()
-        omega_world = self.data.qvel[3:6].copy()
+        quat = data.qpos[3:7]
+        inv_quat = math.quat_inv(quat)
         
-        v_local = self._quat_rotate_inverse(quat, v_world)
-        omega_local = self._quat_rotate_inverse(quat, omega_world)
+        v_local = math.rotate(data.qvel[:3], inv_quat)
+        omega_local = math.rotate(data.qvel[3:6], inv_quat)
+        g_proj = math.rotate(jnp.array([0.0, 0.0, -1.0]), inv_quat)
         
-        g_world = np.array([0.0, 0.0, -1.0], dtype=np.float32)
-        g_proj = self._quat_rotate_inverse(quat, g_world)
-        
-        base_z = self.data.qpos[2]
-        q_joints = self.data.qpos[7:19].copy()
-        dq_joints = self.data.qvel[6:18].copy()
+        base_z = data.qpos[2]
+        commands = state.info["commands"]
+        last_action = state.info["last_action"]
         
         # --- SENSOR EXTRACTION ---
-        # Assuming identical sensor layout to the JAX mjcf definition
-        foot_forces = self.data.sensordata[-9:-5]
-        num_feet_touching = np.sum(foot_forces > 0.1)
+        # Foot contacts: index -9 to -6 (FL, FR, RL, RR from go2_mjx.xml)
+        foot_forces = data.sensordata[-9:-5]
+        num_feet_touching = jnp.sum(foot_forces > 0.1)
         
-        has_illegal_touch = np.any(self.data.sensordata[-5:] > 0.1)
+        # Illegal contacts: index -5 to end (belly + 4 thighs)
+        has_illegal_touch = jnp.any(data.sensordata[-5:] > 0.1)
         
         # --- TERMINATION LOGIC ---
-        is_inverted = bool(g_proj[2] > -0.4)
-        is_crashed = bool(is_inverted or has_illegal_touch)
+        is_inverted = g_proj[2] > -0.4  # Tilted beyond ~65 degrees
+        # Note: is_bottomed checking base_z was completely removed as requested!
+        
+        is_crashed = jnp.logical_or(is_inverted, has_illegal_touch)
+        done = jnp.where(is_crashed, 1.0, 0.0)
         
         reward = self._calc_reward(
             v_local, omega_local, g_proj, base_z,
-            q_joints, dq_joints, action, is_crashed, num_feet_touching
+            data.qpos[7:19], data.qvel[6:18],
+            action, last_action, commands, is_crashed, num_feet_touching
         )
         
-        self.last_action = action.copy()
-        self.step_count += 1
-        obs = self._get_obs()
+        obs = self._get_obs(pipeline_state, action, commands)
         
-        info = {
-            "is_crashed": is_crashed,
-            "commands": self.commands.copy()
-        }
+        info = state.info
+        info["last_action"] = action
+        info["step_count"] += 1
+        info["is_crashed"] = done
         
-        # Terminated handles crashes, Truncated is managed by Gym TimeLimit wrapper[cite: 1]
-        return obs, reward, is_crashed, False, info
+        return state.replace(
+            pipeline_state=pipeline_state,
+            obs=obs,
+            reward=reward,
+            done=done,
+            info=info
+        )
 
     def _calc_reward(
         self, v_local, omega_local, g_proj, base_z,
-        q_joints, dq_joints, action, is_crashed, num_feet_touching
-    ):
-        lin_vel_error = np.sum(np.square(v_local[:2] - self.commands[:2]))
-        r_lin_vel = np.exp(-lin_vel_error / 0.25) * 1.5
+        q_joints, dq_joints, action, last_action,
+        commands, is_crashed, num_feet_touching
+    ) -> jax.Array:
         
-        ang_vel_error = np.square(omega_local[2] - self.commands[2])
-        r_ang_vel = np.exp(-ang_vel_error / 0.25) * 0.8
+        lin_vel_error = jnp.sum(jnp.square(v_local[:2] - commands[:2]))
+        r_lin_vel = jnp.exp(-lin_vel_error / 0.25) * 1.5
         
-        r_z_vel = -np.square(v_local[2]) * 1.0
-        r_ang_rates = -np.sum(np.square(omega_local[:2])) * 0.05
-        r_flat_posture = -np.sum(np.square(g_proj[:2])) * 2.5
-        r_height = -np.square(base_z - self.target_height) * 10.0
-        r_action_rate = -np.sum(np.square(action - self.last_action)) * 0.02
-        r_joint_vel = -np.sum(np.square(dq_joints)) * 0.0001
-        r_joint_nominal = -np.sum(np.square(q_joints - self.q_nom)) * 0.02
+        ang_vel_error = jnp.square(omega_local[2] - commands[2])
+        r_ang_vel = jnp.exp(-ang_vel_error / 0.25) * 0.8
         
-        r_airborne = -0.2 if num_feet_touching == 0 else 0.0
-        r_alive = -1.0 if is_crashed else 0.5
+        r_z_vel = -jnp.square(v_local[2]) * 1.0
+        r_ang_rates = -jnp.sum(jnp.square(omega_local[:2])) * 0.05
+        r_flat_posture = -jnp.sum(jnp.square(g_proj[:2])) * 2.5
+        r_height = -jnp.square(base_z - self.target_height) * 10.0
+        r_action_rate = -jnp.sum(jnp.square(action - last_action)) * 0.02
+        r_joint_vel = -jnp.sum(jnp.square(dq_joints)) * 0.0001
+        r_joint_nominal = -jnp.sum(jnp.square(q_joints - self.q_nom)) * 0.02
+        
+        # User requested: Tiny penalty if 0 paws are touching the ground
+        r_airborne = jnp.where(num_feet_touching == 0, -0.2, 0.0)
+        
+        r_alive = jnp.where(is_crashed, -1.0, 0.5)
         
         total_reward = (
-            r_lin_vel + r_ang_vel + r_z_vel + r_ang_rates + r_flat_posture + 
-            r_height + r_action_rate + r_joint_vel + r_joint_nominal + 
-            r_airborne + r_alive
+            r_lin_vel +
+            r_ang_vel +
+            r_z_vel +
+            r_ang_rates +
+            r_flat_posture +
+            r_height +
+            r_action_rate +
+            r_joint_vel +
+            r_joint_nominal +
+            r_airborne +
+            r_alive
         )
         
-        return float(np.clip(total_reward, -5.0, 10.0) * 0.02)
+        return jnp.clip(total_reward, -5.0, 10.0) * 0.02
