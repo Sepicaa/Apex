@@ -19,55 +19,44 @@ class InteractiveCommandState:
         self.v_x = 0.0
         self.v_y = 0.0
         self.omega_z = 0.0
-        self.is_sitting = 0.0
         self.should_reset = False
         self.running = True
 
-    def get_command_array(self) -> jnp.ndarray:
-        return jnp.array([self.v_x, self.v_y, self.omega_z, self.is_sitting], dtype=jnp.float32)
+    def get_command_array(self) -> np.ndarray:
+        return np.array([self.v_x, self.v_y, self.omega_z], dtype=np.float32)
 
 
 # --- Tkinter Control Dashboard ---
 def start_control_panel(cmd_state: InteractiveCommandState):
     root = tk.Tk()
     root.title("Unitree Go2 Teleop Controller")
-    root.geometry("380x360")
+    root.geometry("380x300")
     root.resizable(False, False)
 
-    # Styling
     style = ttk.Style(root)
     style.theme_use("clam")
 
     ttk.Label(root, text="Go2 Policy Controller", font=("Helvetica", 14, "bold")).pack(pady=10)
 
-    # Forward / Backward Slider (Vx)
     ttk.Label(root, text="Linear Velocity Vx (m/s):").pack()
     vx_slider = ttk.Scale(root, from_=-1.5, to=1.5, orient="horizontal", length=300)
     vx_slider.set(0.0)
     vx_slider.pack(pady=2)
 
-    # Lateral Slider (Vy)
     ttk.Label(root, text="Lateral Velocity Vy (m/s):").pack()
     vy_slider = ttk.Scale(root, from_=-1.0, to=1.0, orient="horizontal", length=300)
     vy_slider.set(0.0)
     vy_slider.pack(pady=2)
 
-    # Yaw Slider (Wz)
     ttk.Label(root, text="Angular Velocity Wz (rad/s):").pack()
     wz_slider = ttk.Scale(root, from_=-1.5, to=1.5, orient="horizontal", length=300)
     wz_slider.set(0.0)
     wz_slider.pack(pady=2)
 
-    # Sitting Checkbox
-    sit_var = tk.BooleanVar(value=False)
-    sit_chk = ttk.Checkbutton(root, text="Execute Sitting Posture (is_sitting)", variable=sit_var)
-    sit_chk.pack(pady=10)
-
     def update_values():
         cmd_state.v_x = float(vx_slider.get())
         cmd_state.v_y = float(vy_slider.get())
         cmd_state.omega_z = float(wz_slider.get())
-        cmd_state.is_sitting = 1.0 if sit_var.get() else 0.0
         if cmd_state.running:
             root.after(20, update_values)
 
@@ -75,13 +64,12 @@ def start_control_panel(cmd_state: InteractiveCommandState):
         vx_slider.set(0.0)
         vy_slider.set(0.0)
         wz_slider.set(0.0)
-        sit_var.set(False)
 
     def trigger_reset():
         cmd_state.should_reset = True
 
     btn_frame = ttk.Frame(root)
-    btn_frame.pack(pady=10)
+    btn_frame.pack(pady=15)
     ttk.Button(btn_frame, text="Stop / Zero", command=zero_all).grid(row=0, column=0, padx=5)
     ttk.Button(btn_frame, text="Reset Robot", command=trigger_reset).grid(row=0, column=1, padx=5)
 
@@ -97,7 +85,7 @@ def start_control_panel(cmd_state: InteractiveCommandState):
 # --- Math & Quaternion Helpers ---
 def quat_rotate_inverse(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     """Rotates vector v from world frame to body frame using inverse quaternion [w, x, y, z]."""
-    w, x, y, z = q[0], -q[1], -q[2], -q[3]  # Conjugate / Inverse
+    w, x, y, z = q[0], -q[1], -q[2], -q[3]
     q_vec = np.array([x, y, z])
     uv = np.cross(q_vec, v)
     uuv = np.cross(q_vec, uv)
@@ -105,7 +93,7 @@ def quat_rotate_inverse(q: np.ndarray, v: np.ndarray) -> np.ndarray:
 
 
 # --- Policy Checkpoint Loader ---
-def load_trained_actor(ckpt_dir: str, obs_dim: int = 49, action_dim: int = 12):
+def load_trained_actor(ckpt_dir: str, obs_dim: int = 48, action_dim: int = 12):
     actor = Actor(action_dim=action_dim)
     dummy_obs = jnp.zeros((1, obs_dim))
     key = jax.random.PRNGKey(0)
@@ -118,32 +106,30 @@ def load_trained_actor(ckpt_dir: str, obs_dim: int = 49, action_dim: int = 12):
 
 # --- Main Simulation Loop ---
 def main():
-    xml_path = "third_party/mujoco_menagerie/unitree_go2/scene.xml"
-    ckpt_path = os.path.abspath("./checkpoints/step_350")  # Change to your target checkpoint
+    # Use the mjx compiled XML so sensors perfectly match what the policy was trained on
+    xml_path = "third_party/mujoco_menagerie/unitree_go2/scene_mjx.xml"
+    ckpt_path = os.path.abspath("./checkpoints/step_50")  # Change to your target checkpoint
 
-    # Nominal joint configuration (Matching Go2Env)
     q_nom = np.array([
-         0.1,  0.8, -1.5,  # Front Right
-        -0.1,  0.8, -1.5,  # Front Left
-         0.1,  1.0, -1.5,  # Rear Right
-        -0.1,  1.0, -1.5   # Rear Left
+        0.0, 0.9, -1.8,  # Front Left
+        0.0, 0.9, -1.8,  # Front Right
+        0.0, 0.9, -1.8,  # Rear Left
+        0.0, 0.9, -1.8   # Rear Right
     ])
 
-    # 1. Load MuJoCo Model & Physics
     m = mujoco.MjModel.from_xml_path(xml_path)
     d = mujoco.MjData(m)
 
-    # 2. Load Neural Policy
     print(f"Loading checkpoint from: {ckpt_path}")
-    actor, params = load_trained_actor(ckpt_path, obs_dim=49, action_dim=12)
+    actor, params = load_trained_actor(ckpt_path, obs_dim=48, action_dim=12)
 
-    # 3. Launch UI Thread
     cmd_state = InteractiveCommandState()
     gui_thread = threading.Thread(target=start_control_panel, args=(cmd_state,), daemon=True)
     gui_thread.start()
 
     def reset_sim():
         mujoco.mj_resetData(m, d)
+        d.qpos[2] = 0.28  # Target standing height
         d.qpos[7:19] = q_nom
         mujoco.mj_forward(m, d)
 
@@ -161,33 +147,39 @@ def main():
                 last_action = np.zeros(12, dtype=np.float32)
                 cmd_state.should_reset = False
 
-            # --- 1. Construct 49D Observation ---
-            v_base = d.qvel[:3]
-            omega_base = d.qvel[3:6]
+            # --- 1. Construct 48D Observation (Mirroring Go2Env exactly) ---
             quat = d.qpos[3:7]  # [w, x, y, z]
+            
+            # Local velocities
+            v_local = quat_rotate_inverse(quat, d.qvel[:3])
+            omega_local = quat_rotate_inverse(quat, d.qvel[3:6])
             g_proj = quat_rotate_inverse(quat, np.array([0.0, 0.0, -1.0]))
+            
             q_joints = d.qpos[7:19]
             dq_joints = d.qvel[6:18]
             commands = cmd_state.get_command_array()
 
             obs = np.concatenate([
-                v_base,
-                omega_base,
+                v_local,
+                omega_local,
                 g_proj,
                 q_joints - q_nom,
-                dq_joints,
+                dq_joints * 0.05,
                 last_action,
                 commands
             ]).astype(np.float32)
 
-            # --- 2. Policy Inference (Deterministic Mean) ---
+            # Armor the network against simulation physics spikes
+            obs = np.clip(obs, -10.0, 10.0)
+
+            # --- 2. Policy Inference ---
             obs_jax = jnp.array(obs)[None, :]
             mean_action, _ = actor.apply(params, obs_jax)
             action = np.array(mean_action[0])
             action_clipped = np.clip(action, -1.0, 1.0)
 
-            # --- 3. Action Scaling & PD Actuation ---
-            action_scaled = action_clipped * 0.8
+            # --- 3. Action Scaling & Actuation ---
+            action_scaled = action_clipped * 0.5
             target_angles = q_nom + action_scaled
             d.ctrl[:] = target_angles
             last_action = action_clipped
@@ -198,12 +190,10 @@ def main():
 
             viewer.sync()
 
-            # Maintain Real-Time Speed (50 Hz control loop = 0.02s per step)
             elapsed = time.time() - step_start
             sleep_time = (m.opt.timestep * n_frames) - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
-
 
 if __name__ == "__main__":
     main()
