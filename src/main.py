@@ -31,11 +31,11 @@ def main():
     print("Initializing Unitree Go2 PPO Training Pipeline...")
     
     cfg = PPOConfig(
-        num_envs=64,
-        num_steps=128,
-        num_epochs=5,
-        num_minibatches=8,
-        entropy_coef=0.002,
+        num_envs=2048,
+        num_steps=256,
+        num_epochs=7,
+        num_minibatches=32,
+        entropy_coef=0.001,
         lr_actor=5e-4,
         lr_critic=5e-4,
     )
@@ -87,7 +87,7 @@ def main():
 
     global_start_time = time.time()
     
-    for i in range(start_iteration, total_iterations):
+    for i in range(start_iteration, start_iteration+total_iterations):
         start_time = time.time()
         
         rng, iter_rng = jax.random.split(rng)
