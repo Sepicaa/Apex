@@ -21,6 +21,10 @@ class InteractiveCommandState:
         self.omega_z = 0.0
         self.should_reset = False
         self.running = True
+        
+        # Add metric trackers
+        self.current_z_height = 0.0
+        self.is_crashed = False
 
     def get_command_array(self) -> np.ndarray:
         return np.array([self.v_x, self.v_y, self.omega_z], dtype=np.float32)
@@ -30,7 +34,7 @@ class InteractiveCommandState:
 def start_control_panel(cmd_state: InteractiveCommandState):
     root = tk.Tk()
     root.title("Unitree Go2 Teleop Controller")
-    root.geometry("380x300")
+    root.geometry("400x380") # Made slightly taller for the metrics
     root.resizable(False, False)
 
     style = ttk.Style(root)
@@ -38,7 +42,16 @@ def start_control_panel(cmd_state: InteractiveCommandState):
 
     ttk.Label(root, text="Go2 Policy Controller", font=("Helvetica", 14, "bold")).pack(pady=10)
 
-    ttk.Label(root, text="Linear Velocity Vx (m/s):").pack()
+    # --- Live Metrics Frame ---
+    metrics_frame = ttk.LabelFrame(root, text="Live Robot Metrics")
+    metrics_frame.pack(fill="x", padx=20, pady=5)
+    
+    z_label = ttk.Label(metrics_frame, text="Base Z-Height: 0.000 m", font=("Courier", 10))
+    z_label.pack(anchor="w", padx=10, pady=2)
+    
+    status_label = ttk.Label(metrics_frame, text="Status: ALIVE", font=("Courier", 10, "bold"), foreground="green")
+    status_label.pack(anchor="w", padx=10, pady=2)
+    
     vx_slider = ttk.Scale(root, from_=-1.5, to=1.5, orient="horizontal", length=300)
     vx_slider.set(0.0)
     vx_slider.pack(pady=2)
@@ -57,6 +70,14 @@ def start_control_panel(cmd_state: InteractiveCommandState):
         cmd_state.v_x = float(vx_slider.get())
         cmd_state.v_y = float(vy_slider.get())
         cmd_state.omega_z = float(wz_slider.get())
+        
+        # Update Live Metrics UI
+        z_label.config(text=f"Base Z-Height: {cmd_state.current_z_height:.3f} m")
+        if cmd_state.is_crashed:
+            status_label.config(text="Status: CRASHED", foreground="red")
+        else:
+            status_label.config(text="Status: ALIVE", foreground="green")
+            
         if cmd_state.running:
             root.after(20, update_values)
 
@@ -105,10 +126,10 @@ def load_trained_actor(ckpt_dir: str, obs_dim: int = 48, action_dim: int = 12):
 
 
 # --- Main Simulation Loop ---
-def main():
+def main(num):
     # Use the mjx compiled XML so sensors perfectly match what the policy was trained on
     xml_path = "third_party/mujoco_menagerie/unitree_go2/scene_mjx.xml"
-    ckpt_path = os.path.abspath("./checkpoints/step_200")  # Change to your target checkpoint
+    ckpt_path = os.path.abspath(f"./checkpoints/step_{num}")  # Change to your target checkpoint
 
     q_nom = np.array([
         0.0, 0.9, -1.8,  # Front Left
@@ -139,13 +160,36 @@ def main():
 
     print("Launching MuJoCo Viewer... Use the UI sliders to command the robot.")
     with mujoco.viewer.launch_passive(m, d) as viewer:
+        
+        # 1. Lock the camera to the XML's "track" camera automatically
+        cam_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, "track")
+        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+        viewer.cam.fixedcamid = cam_id
+        
+        # 2. Performance tweaks: Safely update available flags if needed, 
+        # or just omit them since modern mujoco-python handles rendering efficiently.
+        try:
+            viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_STATIC] = False
+        except KeyError:
+            pass
+
         while viewer.is_running() and cmd_state.running:
+            step_start = time.time()
             step_start = time.time()
 
             if cmd_state.should_reset:
                 reset_sim()
                 last_action = np.zeros(12, dtype=np.float32)
                 cmd_state.should_reset = False
+
+
+            # --- Update Tkinter Dashboard Metrics ---
+            cmd_state.current_z_height = d.qpos[2]
+            
+            # Check for crashes using the belly/thigh sensors (index -5 to end)
+            has_illegal_touch = np.any(d.sensordata[-5:] > 0.1)
+            is_inverted = quat_rotate_inverse(d.qpos[3:7], np.array([0.0, 0.0, -1.0]))[2] > -0.4
+            cmd_state.is_crashed = bool(has_illegal_touch or is_inverted)
 
             # --- 1. Construct 48D Observation (Mirroring Go2Env exactly) ---
             quat = d.qpos[3:7]  # [w, x, y, z]
@@ -195,5 +239,11 @@ def main():
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
+import sys
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        main(sys.argv[1])
+    else:
+        main(1400)
+        print("add the step number")
