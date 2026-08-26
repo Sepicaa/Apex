@@ -24,7 +24,6 @@ class Go2Env(PipelineEnv):
             0.0, 0.9, -1.8   # Rear Right
         ])
         
-        # User requested: Action scale of 0.5 for wider control authority
         self.action_scale = 0.5  
         self.target_height = 0.28 
 
@@ -50,13 +49,12 @@ class Go2Env(PipelineEnv):
             action,                  
             commands                 
         ])
-        # --- FIX 1: Clip extremes and wipe any hidden NaNs ---
         obs = jnp.clip(obs, -10.0, 10.0)
         return jnp.nan_to_num(obs)                
 
     def reset(self, rng: jax.Array) -> State:
-        # Added rng_zero for the standing-still probability mask
-        rng, rng_noise, rng_speed, rng_angle, rng_yaw, rng_zero = jax.random.split(rng, 6)
+        # Added rng_phase to roll the dice for the curriculum stage
+        rng, rng_noise, rng_speed, rng_angle, rng_yaw, rng_phase = jax.random.split(rng, 6)
         
         qpos = self.sys.qpos0
         qpos = qpos.at[2].set(self.target_height)
@@ -67,27 +65,32 @@ class Go2Env(PipelineEnv):
         qvel = jnp.zeros(self.sys.nv)
         pipeline_state = self.pipeline_init(qpos, qvel)
         
-        # --- ADVANCED COMMAND SAMPLING LOGIC ---
-        # 1. Base translation speed and heading
-        speed = jax.random.uniform(rng_speed, (), minval=0.0, maxval=1.2)
+        # --- OVERLAPPING CURRICULUM LOGIC ---
+        # Roll a float between 0.0 and 1.0 to select the phase
+        phase_sampler = jax.random.uniform(rng_phase, ())
         
-        # FIX 2: Omnidirectional heading (-pi to pi) allows full 360-degree movement
-        angle = jax.random.uniform(rng_angle, (), minval=-jnp.pi, maxval=jnp.pi) 
+        # Define the probability boundaries (e.g., 20% Stand, 30% Walk Forward, 50% Omni)
+        is_phase_1 = phase_sampler < 0.20
+        is_phase_2 = jnp.logical_and(phase_sampler >= 0.20, phase_sampler < 0.50)
+        # Phase 3 covers the remaining 0.50 to 1.0
         
-        # 2. Base Yaw
+        # Generate the raw maximum bounds
+        base_speed = jax.random.uniform(rng_speed, (), minval=0.0, maxval=1.2)
+        omni_angle = jax.random.uniform(rng_angle, (), minval=-jnp.pi, maxval=jnp.pi) 
         raw_yaw = jax.random.uniform(rng_yaw, (), minval=-1.0, maxval=1.0)
         
-        # FIX 1: 15% of the time, forcefully overwrite the speed and yaw to exactly 0.0
-        # This teaches the Actor how to stand perfectly still without drifting
-        is_zero_cmd = jax.random.uniform(rng_zero, ()) < 0.15
-        speed = jnp.where(is_zero_cmd, 0.0, speed)
-        raw_yaw = jnp.where(is_zero_cmd, 0.0, raw_yaw)
+        # Apply the phase masks to restrict the vectors
+        # Phase 1: speed = 0, angle = 0, yaw = 0 (Standing Still)
+        speed = jnp.where(is_phase_1, 0.0, base_speed)
+        raw_yaw = jnp.where(is_phase_1, 0.0, raw_yaw)
         
-        # 3. Calculate final velocity vectors
+        # Phase 2: angle is strictly 0.0 (Forward Walk Only). Phase 3 gets omni_angle.
+        angle = jnp.where(is_phase_1, 0.0, jnp.where(is_phase_2, 0.0, omni_angle))
+        
+        # Calculate final velocity vectors
         v_x = speed * jnp.cos(angle)
         v_y = speed * jnp.sin(angle)
         
-        # Coupled Yaw: As linear speed approaches 1.2 m/s, maximum yaw shrinks to near 0.
         speed_penalty = (speed / 1.2) * 0.85 
         omega_z = raw_yaw * (1.0 - speed_penalty)
         
@@ -128,8 +131,6 @@ class Go2Env(PipelineEnv):
         commands = state.info["commands"]
         last_action = state.info["last_action"]
         
-        # --- FIX 2: Detect Physics Explosions ---
-        # If the solver diverged, qvel or qpos will contain NaNs
         has_nans = jnp.any(jnp.isnan(data.qvel)) | jnp.any(jnp.isnan(data.qpos))
         
         foot_forces = data.sensordata[-9:-5]
@@ -138,7 +139,6 @@ class Go2Env(PipelineEnv):
         
         is_inverted = g_proj[2] > -0.4 
         
-        # Treat a physics explosion exactly like a fatal crash
         is_crashed = jnp.logical_or(is_inverted, has_illegal_touch)
         is_crashed = jnp.logical_or(is_crashed, has_nans)
         
@@ -150,8 +150,6 @@ class Go2Env(PipelineEnv):
             action, last_action, commands, is_crashed, num_feet_touching
         )
         
-        # --- FIX 3: Sanitize the Reward ---
-        # Mathematical operations on a NaN state result in a NaN reward. Overwrite it.
         reward = jnp.where(has_nans, -1.0, reward)
         
         obs = self._get_obs(pipeline_state, action, commands)
@@ -189,7 +187,6 @@ class Go2Env(PipelineEnv):
         r_joint_vel = -jnp.sum(jnp.square(dq_joints)) * 0.0001
         r_joint_nominal = -jnp.sum(jnp.square(q_joints - self.q_nom)) * 0.02
         
-        # User requested: Tiny penalty if 0 paws are touching the ground
         r_airborne = jnp.where(num_feet_touching == 0, -0.2, 0.0)
         
         r_alive = jnp.where(is_crashed, -1.0, 0.5)
