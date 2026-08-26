@@ -108,7 +108,7 @@ def load_trained_actor(ckpt_dir: str, obs_dim: int = 48, action_dim: int = 12):
 def main():
     # Use the mjx compiled XML so sensors perfectly match what the policy was trained on
     xml_path = "third_party/mujoco_menagerie/unitree_go2/scene_mjx.xml"
-    ckpt_path = os.path.abspath("./checkpoints/step_50")  # Change to your target checkpoint
+    ckpt_path = os.path.abspath("./checkpoints/step_200")  # Change to your target checkpoint
 
     q_nom = np.array([
         0.0, 0.9, -1.8,  # Front Left

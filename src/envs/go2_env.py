@@ -55,7 +55,8 @@ class Go2Env(PipelineEnv):
         return jnp.nan_to_num(obs)                
 
     def reset(self, rng: jax.Array) -> State:
-        rng, rng_noise, rng_speed, rng_angle, rng_yaw = jax.random.split(rng, 5)
+        # Added rng_zero for the standing-still probability mask
+        rng, rng_noise, rng_speed, rng_angle, rng_yaw, rng_zero = jax.random.split(rng, 6)
         
         qpos = self.sys.qpos0
         qpos = qpos.at[2].set(self.target_height)
@@ -69,15 +70,25 @@ class Go2Env(PipelineEnv):
         # --- ADVANCED COMMAND SAMPLING LOGIC ---
         # 1. Base translation speed and heading
         speed = jax.random.uniform(rng_speed, (), minval=0.0, maxval=1.2)
-        # Favor forward motion, but allow slight diagonal/sideways walking
-        angle = jax.random.uniform(rng_angle, (), minval=-0.5, maxval=0.5) 
         
+        # FIX 2: Omnidirectional heading (-pi to pi) allows full 360-degree movement
+        angle = jax.random.uniform(rng_angle, (), minval=-jnp.pi, maxval=jnp.pi) 
+        
+        # 2. Base Yaw
+        raw_yaw = jax.random.uniform(rng_yaw, (), minval=-1.0, maxval=1.0)
+        
+        # FIX 1: 15% of the time, forcefully overwrite the speed and yaw to exactly 0.0
+        # This teaches the Actor how to stand perfectly still without drifting
+        is_zero_cmd = jax.random.uniform(rng_zero, ()) < 0.15
+        speed = jnp.where(is_zero_cmd, 0.0, speed)
+        raw_yaw = jnp.where(is_zero_cmd, 0.0, raw_yaw)
+        
+        # 3. Calculate final velocity vectors
         v_x = speed * jnp.cos(angle)
         v_y = speed * jnp.sin(angle)
         
-        # 2. Coupled Yaw: As linear speed approaches 1.2 m/s, maximum yaw shrinks to near 0.
-        raw_yaw = jax.random.uniform(rng_yaw, (), minval=-1.0, maxval=1.0)
-        speed_penalty = (speed / 1.2) * 0.85 # Scales up to 0.85 at max speed
+        # Coupled Yaw: As linear speed approaches 1.2 m/s, maximum yaw shrinks to near 0.
+        speed_penalty = (speed / 1.2) * 0.85 
         omega_z = raw_yaw * (1.0 - speed_penalty)
         
         commands = jnp.array([v_x, v_y, omega_z])
