@@ -18,10 +18,10 @@ class Go2Env(PipelineEnv):
         sys = mjcf.load_model(mj_model)
         
         self.q_nom = jnp.array([
-            0.0, 0.9, -1.8,  # Front Left
-            0.0, 0.9, -1.8,  # Front Right
-            0.0, 0.9, -1.8,  # Rear Left
-            0.0, 0.9, -1.8   # Rear Right
+            0.0, 0.8, -1.5,  # Front Left
+            0.0, 0.8, -1.5,  # Front Right
+            0.0, 0.8, -1.5,  # Rear Left
+            0.0, 0.8, -1.5   # Rear Right
         ])
         
         self.action_scale = 0.5  
@@ -138,10 +138,12 @@ class Go2Env(PipelineEnv):
         num_feet_touching = jnp.sum(foot_forces > 0.1)
         has_illegal_touch = jnp.any(data.sensordata[-5:] > 0.1)
         
-        is_inverted = g_proj[2] > -0.4 
+        is_inverted = g_proj[2] > -0.4
+        is_bottomed_out = base_z < 0.22 
         
         is_crashed = jnp.logical_or(is_inverted, has_illegal_touch)
         is_crashed = jnp.logical_or(is_crashed, has_nans)
+        is_crashed = jnp.logical_or(is_crashed, is_bottomed_out)
         
         done = jnp.where(is_crashed, 1.0, 0.0)
         
@@ -184,14 +186,14 @@ class Go2Env(PipelineEnv):
         r_z_vel = -jnp.square(v_local[2]) * 2.0
         r_ang_rates = -jnp.sum(jnp.square(omega_local[:2])) * 0.05
         r_flat_posture = -jnp.sum(jnp.square(g_proj[:2])) * 2.5
-        r_height = -jnp.square(base_z - self.target_height) * 5.0
-        r_action_rate = -jnp.sum(jnp.square(action - last_action)) * 0.02
-        r_joint_vel = -jnp.sum(jnp.square(dq_joints)) * 0.001
-        r_joint_nominal =  jnp.where(phase < 0.20, -jnp.sum(jnp.square(q_joints - self.q_nom)) * 0.01, 0)
+        r_height = -jnp.square(base_z - self.target_height) * 10.0
+        r_action_rate = -jnp.sum(jnp.square(action - last_action)) * 0.06
+        r_joint_vel = -jnp.sum(jnp.square(dq_joints)) * 0.002
+        r_joint_nominal = -jnp.sum(jnp.square(q_joints - self.q_nom)) * 0.01        
         
         r_airborne = jnp.where(num_feet_touching == 0, -0.2, 0.0)
         
-        r_alive = jnp.where(is_crashed, -1.0, 0.5)
+        r_alive = jnp.where(is_crashed, -1.0, 0.8)
         
         total_reward = (
             r_lin_vel +
