@@ -25,7 +25,7 @@ class Go2Env(PipelineEnv):
         ])
         
         self.action_scale = 0.5  
-        self.target_height = 0.28 
+        self.target_height = 0.3 
 
         super().__init__(sys, backend='mjx', n_frames=5, **kwargs)
 
@@ -73,6 +73,7 @@ class Go2Env(PipelineEnv):
         is_phase_1 = phase_sampler < 0.20
         is_phase_2 = jnp.logical_and(phase_sampler >= 0.20, phase_sampler < 0.50)
         # Phase 3 covers the remaining 0.50 to 1.0
+        is_phase_1 = 1
         
         # Generate the raw maximum bounds
         base_speed = jax.random.uniform(rng_speed, (), minval=0.0, maxval=1.2)
@@ -174,18 +175,18 @@ class Go2Env(PipelineEnv):
     ) -> jax.Array:
         
         lin_vel_error = jnp.sum(jnp.square(v_local[:2] - commands[:2]))
-        r_lin_vel = jnp.exp(-lin_vel_error / 0.25) * 1.5
+        r_lin_vel = jnp.exp(-lin_vel_error / 0.25) * 5
         
         ang_vel_error = jnp.square(omega_local[2] - commands[2])
-        r_ang_vel = jnp.exp(-ang_vel_error / 0.25) * 0.8
+        r_ang_vel = jnp.exp(-ang_vel_error / 0.25) * 1.8
         
-        r_z_vel = -jnp.square(v_local[2]) * 1.0
+        r_z_vel = -jnp.square(v_local[2]) * 2.0
         r_ang_rates = -jnp.sum(jnp.square(omega_local[:2])) * 0.05
         r_flat_posture = -jnp.sum(jnp.square(g_proj[:2])) * 2.5
-        r_height = -jnp.square(base_z - self.target_height) * 10.0
+        r_height = -jnp.square(base_z - self.target_height) * 5.0
         r_action_rate = -jnp.sum(jnp.square(action - last_action)) * 0.02
-        r_joint_vel = -jnp.sum(jnp.square(dq_joints)) * 0.0001
-        r_joint_nominal = -jnp.sum(jnp.square(q_joints - self.q_nom)) * 0.02
+        r_joint_vel = -jnp.sum(jnp.square(dq_joints)) * 0.001
+        r_joint_nominal = -jnp.sum(jnp.square(q_joints - self.q_nom)) * 0.005
         
         r_airborne = jnp.where(num_feet_touching == 0, -0.2, 0.0)
         
@@ -205,4 +206,4 @@ class Go2Env(PipelineEnv):
             r_alive
         )
         
-        return jnp.clip(total_reward, -5.0, 10.0) * 0.02
+        return jnp.clip(total_reward, -40.0, 70.0) * 0.02

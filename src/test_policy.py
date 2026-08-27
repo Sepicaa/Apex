@@ -13,6 +13,13 @@ import orbax.checkpoint as ocp
 
 from src.training.networks import Actor
 
+
+import signal
+def force_exit_handler(sig, frame):
+    print("\n[!] Ctrl+C detected. Forcing clean exit...")
+    os._exit(0)
+
+signal.signal(signal.SIGINT, force_exit_handler)
 # --- Shared Command State ---
 class InteractiveCommandState:
     def __init__(self):
@@ -245,5 +252,5 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         main(sys.argv[1])
     else:
-        main(2400)
+        main(60)
         print("add the step number")
