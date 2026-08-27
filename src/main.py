@@ -31,7 +31,7 @@ def main():
     print("Initializing Unitree Go2 PPO Training Pipeline...")
     
     cfg = PPOConfig(
-        num_envs=1024,
+        num_envs=128,
         num_steps=128,
         num_epochs=5,
         num_minibatches=8,
@@ -73,7 +73,7 @@ def main():
             actor_state = actor_state.replace(params=restored_params)
             start_iteration = latest_step + 1
 
-    total_iterations = 3000
+    total_iterations = 5000
     print("Starting Training Loop!")
     print("-" * 80)
     
@@ -140,7 +140,7 @@ def main():
         if i % 5 == 0:
             print(f"Iter {i:04d} | Time: {mins:02d}:{secs:02d} | FPS: {fps:5.0f} | Steps: {mean_steps:6.2f} | Rew: {mean_reward:6.2f} | Falls/Ep: {mean_crashes:4.2f} | P_Loss: {p_loss: .3f} | V_Loss: {v_loss: .3f} | Ent: {entropy: .3f}")
         
-        if i % 10 == 0 and i > 0:
+        if i % 50 == 0 and i > 0:
             checkpointer.save(os.path.join(ckpt_dir, f"step_{i}"), actor_state.params)
             print(f"--> Saved checkpoint at iteration {i}")
 
