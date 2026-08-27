@@ -31,12 +31,12 @@ def main():
     print("Initializing Unitree Go2 PPO Training Pipeline...")
     
     cfg = PPOConfig(
-        num_envs=2048,
-        num_steps=256,
-        num_epochs=7,
-        num_minibatches=32,
-        entropy_coef=0.001,
-        lr_actor=5e-4,
+        num_envs=1024,
+        num_steps=128,
+        num_epochs=5,
+        num_minibatches=8,
+        entropy_coef=0.0005,
+        lr_actor=4e-4,
         lr_critic=5e-4,
     )
     rng = jax.random.PRNGKey(42)
@@ -45,7 +45,7 @@ def main():
     xml_path = "third_party/mujoco_menagerie/unitree_go2/scene_mjx.xml"
     env = Go2Env(xml_path=xml_path)
     
-    env = EpisodeWrapper(env, episode_length=1000, action_repeat=2) 
+    env = EpisodeWrapper(env, episode_length=1000, action_repeat=1) 
     env = AutoResetWrapper(env)
     env = VmapWrapper(env)      
     
@@ -73,13 +73,14 @@ def main():
             actor_state = actor_state.replace(params=restored_params)
             start_iteration = latest_step + 1
 
-    total_iterations = 2500
+    total_iterations = 3000
     print("Starting Training Loop!")
     print("-" * 80)
     
     # Initialize trackers for the last 100 episodes
     ep_return_queue = deque(maxlen=100)
     ep_crash_queue = deque(maxlen=100)
+    ep_step_queue = deque(maxlen=100)
     
     # Running tallies for the 64 parallel environments
     running_returns = np.zeros(cfg.num_envs)
@@ -114,11 +115,12 @@ def main():
                 finished_envs = dones_at_t > 0.5
                 
                 # A fall is any episode that terminates before the 1000-step timeout
-                falls = (running_steps[finished_envs] < 1000).astype(float)
+                falls = (running_steps[finished_envs] < 900).astype(float)
                 
                 # Push the completed episode totals to our rolling queues
                 ep_return_queue.extend(running_returns[finished_envs].tolist())
                 ep_crash_queue.extend(falls.tolist())
+                ep_step_queue.extend(running_steps[finished_envs].tolist())
                 
                 # Reset the running tally for those specific environments
                 running_returns[finished_envs] = 0.0
@@ -127,6 +129,7 @@ def main():
         # 3. Calculate rolling averages
         mean_reward = np.mean(ep_return_queue) if len(ep_return_queue) > 0 else 0.0
         mean_crashes = np.mean(ep_crash_queue) if len(ep_crash_queue) > 0 else 0.0
+        mean_steps = np.mean(ep_step_queue) if len(ep_step_queue) > 0 else 0.0
         
         p_loss = jnp.mean(metrics["policy_loss"])
         v_loss = jnp.mean(metrics["value_loss"])
@@ -134,10 +137,10 @@ def main():
         
         fps = (cfg.num_envs * cfg.num_steps) / step_time
         mins, secs = divmod(int(total_elapsed), 60)
+        if i % 5 == 0:
+            print(f"Iter {i:04d} | Time: {mins:02d}:{secs:02d} | FPS: {fps:5.0f} | Steps: {mean_steps:6.2f} | Rew: {mean_reward:6.2f} | Falls/Ep: {mean_crashes:4.2f} | P_Loss: {p_loss: .3f} | V_Loss: {v_loss: .3f} | Ent: {entropy: .3f}")
         
-        print(f"Iter {i:04d} | Time: {mins:02d}:{secs:02d} | FPS: {fps:5.0f} | Rew: {mean_reward:6.2f} | Falls/Ep: {mean_crashes:4.2f} | P_Loss: {p_loss: .3f} | V_Loss: {v_loss: .3f} | Ent: {entropy: .3f}")
-        
-        if i % 200 == 0 and i > 0:
+        if i % 10 == 0 and i > 0:
             checkpointer.save(os.path.join(ckpt_dir, f"step_{i}"), actor_state.params)
             print(f"--> Saved checkpoint at iteration {i}")
 
