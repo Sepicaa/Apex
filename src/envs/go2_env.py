@@ -25,7 +25,7 @@ class Go2Env(PipelineEnv):
         ])
         
         self.action_scale = 0.5  
-        self.target_height = 0.29 
+        self.target_height = 0.3 
 
         super().__init__(sys, backend='mjx', n_frames=5, **kwargs)
 
@@ -175,7 +175,7 @@ class Go2Env(PipelineEnv):
     ) -> jax.Array:
         
         lin_vel_error = jnp.sum(jnp.square(v_local[:2] - commands[:2]))
-        r_lin_vel = jnp.exp(-lin_vel_error / 0.25) * 3.5
+        r_lin_vel = jnp.exp(-lin_vel_error / 0.25) * 5
         
         ang_vel_error = jnp.square(omega_local[2] - commands[2])
         r_ang_vel = jnp.exp(-ang_vel_error / 0.25) * 1.8
@@ -183,10 +183,10 @@ class Go2Env(PipelineEnv):
         r_z_vel = -jnp.square(v_local[2]) * 2.0
         r_ang_rates = -jnp.sum(jnp.square(omega_local[:2])) * 0.05
         r_flat_posture = -jnp.sum(jnp.square(g_proj[:2])) * 2.5
-        r_height = -jnp.square(base_z - self.target_height) * 10.0
+        r_height = -jnp.square(base_z - self.target_height) * 5.0
         r_action_rate = -jnp.sum(jnp.square(action - last_action)) * 0.02
-        r_joint_vel = -jnp.sum(jnp.square(dq_joints)) * 0.0001
-        r_joint_nominal = -jnp.sum(jnp.square(q_joints - self.q_nom)) * 0.01
+        r_joint_vel = -jnp.sum(jnp.square(dq_joints)) * 0.001
+        r_joint_nominal = -jnp.sum(jnp.square(q_joints - self.q_nom)) * 0.005
         
         r_airborne = jnp.where(num_feet_touching == 0, -0.2, 0.0)
         
