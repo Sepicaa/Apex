@@ -245,5 +245,5 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         main(sys.argv[1])
     else:
-        main(600)
+        main(2400)
         print("add the step number")
