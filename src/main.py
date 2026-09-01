@@ -16,9 +16,9 @@ from src.training.networks import Actor, Critic
 from src.training.train_ppo import PPOConfig, create_train_states, ppo_train_iteration
 
 @partial(jax.jit, static_argnums=(0, 4, 5, 6))
-def compiled_train_step(env, env_state, actor_state, critic_state, actor, critic, cfg, rng):
+def compiled_train_step(env, env_state, actor_state, critic_state, actor, critic, cfg, rng, global_iteration):
     return ppo_train_iteration(
-        env, env_state, actor_state, critic_state, actor, critic, cfg, rng
+        env, env_state, actor_state, critic_state, actor, critic, cfg, rng, global_iteration
     )
 
 def force_exit_handler(sig, frame):
@@ -31,12 +31,12 @@ def main():
     print("Initializing Unitree Go2 PPO Training Pipeline...")
     
     cfg = PPOConfig(
-        num_envs=128,
+        num_envs=1024,
         num_steps=128,
         num_epochs=5,
-        num_minibatches=8,
-        entropy_coef=0.0005,
-        lr_actor=4e-4,
+        num_minibatches=32,
+        entropy_coef=0.0010,
+        lr_actor=3e-4,
         lr_critic=5e-4,
     )
     rng = jax.random.PRNGKey(42)
@@ -94,7 +94,7 @@ def main():
         rng, iter_rng = jax.random.split(rng)
         
         env_state, actor_state, critic_state, metrics = compiled_train_step(
-            env, env_state, actor_state, critic_state, actor, critic, cfg, iter_rng
+            env, env_state, actor_state, critic_state, actor, critic, cfg, iter_rng, jnp.array(i, dtype=jnp.int32)
         )
         
         step_time = time.time() - start_time
@@ -115,7 +115,7 @@ def main():
                 finished_envs = dones_at_t > 0.5
                 
                 # A fall is any episode that terminates before the 1000-step timeout
-                falls = (running_steps[finished_envs] < 900).astype(float)
+                falls = (running_steps[finished_envs] < 999).astype(float)
                 
                 # Push the completed episode totals to our rolling queues
                 ep_return_queue.extend(running_returns[finished_envs].tolist())
@@ -140,7 +140,7 @@ def main():
         if i % 5 == 0:
             print(f"Iter {i:04d} | Time: {mins:02d}:{secs:02d} | FPS: {fps:5.0f} | Steps: {mean_steps:6.2f} | Rew: {mean_reward:6.2f} | Falls/Ep: {mean_crashes:4.2f} | P_Loss: {p_loss: .3f} | V_Loss: {v_loss: .3f} | Ent: {entropy: .3f}")
         
-        if i % 50 == 0 and i > 0:
+        if i % 20 == 0 and i > 0:
             checkpointer.save(os.path.join(ckpt_dir, f"step_{i}"), actor_state.params)
             print(f"--> Saved checkpoint at iteration {i}")
 

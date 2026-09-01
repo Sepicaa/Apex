@@ -157,28 +157,67 @@ def main(num):
 
     def reset_sim():
         mujoco.mj_resetData(m, d)
-        d.qpos[2] = 0.28  # Target standing height
-        d.qpos[7:19] = q_nom
+        
+        # 1. Randomize Base Z-Height (e.g., between 0.25m and 0.35m)
+        d.qpos[2] = np.random.uniform(0.25, 0.35)
+        
+        # 2. Randomize Joint Angles
+        # Bounded between -0.15 and 0.15 radians to maintain physical viability
+        joint_noise = np.random.uniform(-0.15, 0.15, size=12)
+        d.qpos[7:19] = q_nom + joint_noise
+        
+        # 3. Randomize Base Heading (Yaw)
+        # Calculates a valid quaternion [w, x, y, z] for a random Z-axis rotation
+        yaw = np.random.uniform(-np.pi, np.pi)
+        d.qpos[3:7] = np.array([np.cos(yaw / 2.0), 0.0, 0.0, np.sin(yaw / 2.0)])
+        
+        # 4. Optional: Add a slight initial velocity push to test recovery
+        d.qvel[0:2] = np.random.uniform(-0.2, 0.2, size=2) 
+        
         mujoco.mj_forward(m, d)
 
     reset_sim()
     last_action = np.zeros(12, dtype=np.float32)
-    n_frames = 10  # 10 substeps @ 50 Hz control frequency
+    n_frames = 5  # 10 substeps @ 50 Hz control frequency
 
     print("Launching MuJoCo Viewer... Use the UI sliders to command the robot.")
     with mujoco.viewer.launch_passive(m, d) as viewer:
         
-        # 1. Lock the camera to the XML's "track" camera automatically
-        cam_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, "track")
-        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
-        viewer.cam.fixedcamid = cam_id
+        # Track the base body
+        base_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "base")
+        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        viewer.cam.trackbodyid = base_id
+        viewer.cam.distance = 2.5 
+        viewer.cam.elevation = -25 
+        viewer.cam.azimuth = 135
+
+        # --- NEW CODE: Force WSL Performance Settings ---
+        # 1. Disable Heavy OpenGL Effects (Matches the bottom-left of your UI)
+        viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
+        viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
+        viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = 0
+        viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_HAZE] = 0
+        viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_FOG] = 0
+
+        # 2. Disable unnecessary Model Elements (Matches the top-left of your UI)
+        viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONVEXHULL] = 0
+        viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = 0
+        # Ensure the ground plane stays visible!
+        viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_STATIC] = 1 
+        
+        # Apply the changes to the viewer before the while loop starts
+        viewer.sync()
         
         # 2. Performance tweaks: Safely update available flags if needed, 
         # or just omit them since modern mujoco-python handles rendering efficiently.
-        try:
-            viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_STATIC] = False
-        except KeyError:
-            pass
+        # try:
+        #     viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_STATIC] = False
+        # except KeyError:
+        #     pass
+        
+        render_fps = 30
+        render_interval = 1.0 / render_fps
+        last_render_time = time.time()
 
         while viewer.is_running() and cmd_state.running:
             step_start = time.time()
@@ -237,20 +276,23 @@ def main(num):
 
             # --- 4. Step Physics Engine ---
             for _ in range(n_frames):
-                mujoco.mj_step(m, d)
+                    mujoco.mj_step(m, d)
 
-            viewer.sync()
+            # ONLY render if 1/30th of a second has passed
+            if time.time() - last_render_time >= render_interval:
+                viewer.sync()
+                last_render_time = time.time()
 
+            # Sleep to maintain real-time physics pacing
             elapsed = time.time() - step_start
             sleep_time = (m.opt.timestep * n_frames) - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
-
 import sys
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         main(sys.argv[1])
     else:
-        main(700)
+        main(240)
         print("add the step number")

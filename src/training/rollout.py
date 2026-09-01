@@ -13,7 +13,7 @@ class Transition(NamedTuple):
     log_prob: jax.Array
     is_crashed: jax.Array
 
-def collect_rollouts(env, env_state, actor, critic, actor_params, critic_params, rng, num_steps):
+def collect_rollouts(env, env_state, actor, critic, actor_params, critic_params, rng, num_steps, global_iteration):
     
     def _step(runner_state, _):
         current_env_state, last_obs, key = runner_state
@@ -38,11 +38,15 @@ def collect_rollouts(env, env_state, actor, critic, actor_params, critic_params,
         next_env_state = env.step(current_env_state, action_clipped)
         is_crashed = next_env_state.info.get("is_crashed", jnp.zeros_like(next_env_state.done))
         
+        r_nominal = next_env_state.info.get("r_joint_nominal", jnp.zeros_like(next_env_state.reward))
+        decay_weight = jnp.where(global_iteration < 50, 1.0, 0.0)
+        adjusted_reward = next_env_state.reward + (decay_weight * r_nominal)
+        
         # 4. Store the Transition
         transition = Transition(
             obs=last_obs,
             action=raw_action,
-            reward=next_env_state.reward,
+            reward=adjusted_reward,
             done=next_env_state.done,
             value=value,
             log_prob=log_prob,

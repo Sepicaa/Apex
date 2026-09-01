@@ -25,7 +25,7 @@ class Go2Env(PipelineEnv):
         ])
         
         self.action_scale = 0.5  
-        self.target_height = 0.3 
+        self.target_height = 0.32
 
         super().__init__(sys, backend='mjx', n_frames=5, **kwargs)
 
@@ -104,7 +104,8 @@ class Go2Env(PipelineEnv):
             "commands": commands,
             "step_count": jnp.array(0, dtype=jnp.int32),
             "is_crashed": jnp.array(0.0),
-            "phase" : phase_sampler
+            "phase" : phase_sampler,
+            "r_joint_nominal": jnp.array(0.0),
         }
         
         return State(
@@ -145,7 +146,7 @@ class Go2Env(PipelineEnv):
         
         done = jnp.where(is_crashed, 1.0, 0.0)
         
-        reward = self._calc_reward(
+        reward, r_joint_nominal = self._calc_reward(
             v_local, omega_local, g_proj, base_z,
             data.qpos[7:19], data.qvel[6:18],
             action, last_action, commands, is_crashed, num_feet_touching
@@ -160,6 +161,7 @@ class Go2Env(PipelineEnv):
         info["last_action"] = action
         info["step_count"] += 1
         info["is_crashed"] = done
+        info["r_joint_nominal"] = r_joint_nominal
         
         return state.replace(
             pipeline_state=pipeline_state,
@@ -176,22 +178,24 @@ class Go2Env(PipelineEnv):
     ) -> jax.Array:
         
         lin_vel_error = jnp.sum(jnp.square(v_local[:2] - commands[:2]))
-        r_lin_vel = jnp.exp(-lin_vel_error / 0.25) * 5
+        r_lin_vel = jnp.exp(-lin_vel_error / 0.25) * 7.5
         
         ang_vel_error = jnp.square(omega_local[2] - commands[2])
-        r_ang_vel = jnp.exp(-ang_vel_error / 0.25) * 2
+        r_ang_vel = jnp.exp(-ang_vel_error / 0.25) * 3
         
         r_z_vel = -jnp.square(v_local[2]) * 2.0
         r_ang_rates = -jnp.sum(jnp.square(omega_local[:2])) * 0.05
         r_flat_posture = -jnp.sum(jnp.square(g_proj[:2])) * 2.5
-        r_height = -jnp.square(base_z - self.target_height) * 5.0
-        r_action_rate = -jnp.sum(jnp.square(action - last_action)) * 0.02
-        r_joint_vel = -jnp.sum(jnp.square(dq_joints)) * 0.001
-        r_joint_nominal =  jnp.where(phase < 0.20, -jnp.sum(jnp.square(q_joints - self.q_nom)) * 0.01, 0)
+        r_height = -jnp.square(base_z - self.target_height) * 2.5
+        r_action_rate = -jnp.sum(jnp.square(action - last_action)) * 0.005
+        r_joint_vel = -jnp.sum(jnp.square(dq_joints)) * 0.005
+        r_joint_nominal= -jnp.sum(jnp.square(q_joints - self.q_nom)) * 0.01
+        # r_joint_nominal =  jnp.where(phase < 0.20, -jnp.sum(jnp.square(q_joints - self.q_nom)) * 0.01, 0)
+        # r_joint_nominal = 0
         
         r_airborne = jnp.where(num_feet_touching == 0, -0.2, 0.0)
         
-        r_alive = jnp.where(is_crashed, -1.0, 0.5)
+        r_alive = jnp.where(is_crashed, -25.0, 1.0)
         
         total_reward = (
             r_lin_vel +
@@ -202,9 +206,9 @@ class Go2Env(PipelineEnv):
             r_height +
             r_action_rate +
             r_joint_vel +
-            r_joint_nominal +
+            # r_joint_nominal +
             r_airborne +
             r_alive
         )
         
-        return jnp.clip(total_reward, -40.0, 70.0) * 0.02
+        return jnp.clip(total_reward, -50.0, 80.0) * 0.02, r_joint_nominal

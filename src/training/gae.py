@@ -14,7 +14,7 @@ def compute_gae(
         last_gae, next_val = gae_and_next_val
         
         # 1. Mask out future values if the episode terminated
-        non_terminal = 1.0 - transition.done
+        non_terminal = 1.0 - transition.is_crashed
         
         # 2. TD Error: delta = r + gamma * V(s') * (1 - done) - V(s)
         delta = transition.reward + gamma * next_val * non_terminal - transition.value
